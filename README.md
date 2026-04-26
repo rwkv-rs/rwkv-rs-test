@@ -34,14 +34,17 @@ test_gen
             └── lm_head/
                 ├── embedded_context.safetensors
                 └── logits.safetensors
+```
 
 命名规则:
+
 - rwkv_lm只使用bf16: test_gen/rwkv_lm/bf16/...
 - albatross只使用fp16: test_gen/albatross/fp16/...
 - 其它量化方案使用llama.cpp风格snake_case命名, 例如q8_0, q4_k_m, q5_k_m.
 - 每个.safetensors文件只保存一个同名tensor, dtype必须保持导出时原样.
 
 语义约定:
+
 - embedding/embedded_context是Embedding输出, 也是layer_norm0输入, 不重复保存.
 - layer_norm0/embedded_context是cell_0000的残差前输入.
 - pre_layer_norm_for_time_mix/embedded_context是TMix的norm后输入.
@@ -51,7 +54,6 @@ test_gen
 - channel_mixer/embedded_context是CMix残差分支输出.
 - embedded_context_after_channel_mixer是当前cell输出, 也是下一层cell输入.
 - lm_head/embedded_context是LMHead输入, lm_head/logits是LMHead输出.
-```
 
 2. 以下是提供的插桩函数设计, 直接复制到repo中调用完成数据和耗时的导出
 
@@ -353,16 +355,20 @@ RWKV_TRACE_ROOT 负责指定导出根目录；RWKV_TRACE_ONCE=1 表示开启 tra
 ## 启动命令默认
 
 - rwkv-lm：
-  cd train-repo/rwkv-lm
-  RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen RWKV_TRACE_ONCE=1 bash demo-training-run.sh
+    ```
+    cd train-repo/rwkv-lm
+    RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen RWKV_TRACE_ONCE=1 bash demo-training-run.sh
+    ```
 - rwkv-peft pretrain：
-  cd train-repo/rwkv-peft
-  RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen RWKV_TRACE_ONCE=1 \
-  python train.py --load_model "" --proj_dir out_trace --data_file ../../data/minipile \
-   --vocab_size 65536 --data_type binidx --n_layer <N> --n_embd <D> \
-   --ctx_len <T> --micro_bsz <B> --epoch_steps 1 --epoch_count 1 \
-   --accelerator gpu --precision bf16 --devices 1 --strategy auto \
-   --my_testing x070 --peft none
+    ```
+    cd train-repo/rwkv-peft
+    RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen RWKV_TRACE_ONCE=1 \
+    python train.py --load_model "" --proj_dir out_trace --data_file ../../data/minipile \
+     --vocab_size 65536 --data_type binidx --n_layer <N> --n_embd <D> \
+     --ctx_len <T> --micro_bsz <B> --epoch_steps 1 --epoch_count 1 \
+     --accelerator gpu --precision bf16 --devices 1 --strategy auto \
+     --my_testing x070 --peft none
+    ```
 - 推理 repo：
     - 用各自现有 benchmark/demo/server 入口。
     - 设置同样的：
@@ -382,8 +388,6 @@ RWKV_TRACE_ROOT 负责指定导出根目录；RWKV_TRACE_ONCE=1 表示开启 tra
     --baseline /path/to/test_gen/rwkv_lm/bf16/case_000000 \
     --atol 1e-3 --rtol 1e-2 --cos-min 0.999
   ```
-
-```
 - 输入目录不硬编码 repo 名、量化名或层数递归扫描 actual 下所有 .safetensors
 - 用相对路径去 baseline 找同名文件
 - 忽略 *.time.json
@@ -411,18 +415,93 @@ RWKV_TRACE_ROOT 负责指定导出根目录；RWKV_TRACE_ONCE=1 表示开启 tra
     - cosine < cos_min 则失败
     - token_ids 这类整数 tensor 建议要求完全一致，也就是任何 abs diff 都失败
 - 默认输出人类可读表格，按 max_abs 或失败项排序：
-  status path                                      dtype shape        max_abs  max_rel  cosine
-  PASS   lm_head/logits.safetensors               F16   [1,512,...]  3.1e-4   8.2e-3   0.99998
-  FAIL   cells/cell_0003/time_mixer/embedded...   F16   [1,512,768]  1.7e-2   2.4e-1   0.99120
+  status path dtype shape max_abs max_rel cosine
+  PASS lm_head/logits.safetensors F16 [1,512,...] 3.1e-4 8.2e-3 0.99998
+  FAIL cells/cell_0003/time_mixer/embedded... F16 [1,512,768] 1.7e-2 2.4e-1 0.99120
 - 最后输出 summary：
   compared=84 passed=83 failed=1 missing=0 extra=0
   worst_abs=...
   worst_rel=...
   worst_cosine=...
 - 退出码：
-  - 0：全部通过
-  - 1：存在数值差异或契约不匹配
-  - 2：CLI 参数、文件读取、safetensors 解析错误
+    - 0：全部通过
+    - 1：存在数值差异或契约不匹配
+    - 2：CLI 参数、文件读取、safetensors 解析错误
 
-5. 运行不同的推理引擎, [1]记录它们各自的吞吐量Prefill TokenPerSecond和Decode TokenPerSecond [2] 记录延迟指标: TTFT, E2EL, TokenGenerationTime(E2EL-TTFT),TimePerOutputToken(TokenGenerationTime/(token数-1)), ITL, 分位数延迟 . 并且绘制出图像来对比不同的推理后端(需要选择合适的绘图形式来清晰对比).
-```
+5. 运行不同的推理引擎
+   [1] 记录它们各自的吞吐量Prefill TokenPerSecond和Decode TokenPerSecond
+   [2] 记录延迟指标: TTFT, E2EL, TokenGenerationTime(E2EL-TTFT),TimePerOutputToken(TokenGenerationTime/(token数-1)), ITL, 分位数延迟.
+   并且绘制出图像来对比不同的推理后端(需要选择合适的绘图形式来清晰对比).
+
+优先直接使用成熟推理引擎已有 benchmark/server/API 路径测量，不新增推理入口、不改核心调度。只为 albatross、rwkv-lightning 这类 demo 型
+代码，或 web-rwkv / rwkv-mobile 这种只有库/example bench、缺少完整服务压测指标的后端，添加薄测量脚本。
+
+固定测试矩阵：
+
+- bsz = [1, 16, 64, 128, 256, 512, 1024]
+- prompt_len = [16, 256, 512, 1024, 4096]
+- decode_len = 16
+- 允许 warmup
+- 每个仓库输出统一 CSV，并添加绘图脚本
+
+## Measurement Approach
+
+- nano-vllm：
+    - 优先使用现有 OpenAI-compatible server + benchmark_openai_api_perf.py / benchmark_openai_api.py。
+    - 用 users_sweep 映射 bsz，max_tokens=16，开启 streaming 以获得 TTFT / E2EL / ITL。
+    - 如需严格 token 长度，用现有 benchmark_rwkv.py 的 direct engine 路径补充 exact prompt_len 的 prefill/decode TPS，不新增服务入口。
+- llama.cpp：
+    - 吞吐量优先使用原生 llama-batched-bench：pl=bsz、pp=prompt_len、tg=16、JSONL 输出。
+    - 延迟指标优先使用现有 llama-server + scripts/server-bench.py 或 OpenAI-compatible streaming 请求测 TTFT / E2EL / ITL。
+    - 只添加结果转换脚本，把原生 JSONL / server-bench 输出规整成统一 CSV。
+- albatross / rwkv-lightning：
+    - 作为 demo 型后端，直接打印时间来完成测量。
+    - 直接调用真实 tokenizer/model forward 路径；prefill 用 batch prompt，decode 循环 16 token。
+    - 只测原始代码可提供的路径；不实现完整队列调度。
+- web-rwkv：
+    - 基于现有 examples/bench.rs 扩展为 CSV benchmark example。
+    - 不实现 server/scheduler，只测 library runtime 的 prefill/decode 原始路径。
+- rwkv-mobile：
+    - 基于已有 simple_benchmark.cpp / batch_benchmark.cpp 增加 CSV 输出版本。
+    - 优先用已有 runtime API 和 batch decode；不补完整请求队列。
+    - 不支持的 bsz/prompt_len 组合写 status=failed 或 status=unsupported。
+
+## CSV Schema
+
+统一字段：
+
+- repo,backend,model_path,model_format,device,dtype,quantization
+- bsz,prompt_len,decode_len,warmup,repeat,seed,status,error
+- prefill_tokens,output_tokens
+- prefill_time_s,ttft_s,e2el_s,token_generation_time_s
+- prefill_tps,decode_tps,e2e_tps,time_per_output_token_ms
+- itl_mean_ms,itl_p50_ms,itl_p90_ms,itl_p95_ms,itl_p99_ms
+
+指标定义：
+
+- TTFT：请求开始到首个输出 token 到达。
+- E2EL：请求开始到 16 个输出 token 完成。
+- TokenGenerationTime = E2EL - TTFT。
+- TimePerOutputToken = TokenGenerationTime / (decode_len - 1)。
+- ITL：首 token 后相邻 token 到达间隔。
+- Prefill TokenPerSecond = bsz \* prompt_len / prefill_time_s。
+- Decode TokenPerSecond = bsz \* (decode_len - 1) / TokenGenerationTime。
+
+## Plotting
+
+每个仓库添加 plot_task5.py，读取本仓库 CSV 并输出：
+
+- results/task5_prefill_tps.png
+- results/task5_decode_tps.png
+- results/task5_ttft.png
+- results/task5_e2el.png
+- results/task5_itl_p95.png
+
+图形规则：
+
+- x 轴为 bsz
+- 按 prompt_len 分面或分图
+- 不同后端/模式用不同颜色
+- 吞吐图使用 log y 轴
+- 延迟图使用 ms 单位
+- 失败组合不绘图，但保留在 CSV
