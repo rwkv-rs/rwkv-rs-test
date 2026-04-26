@@ -1,6 +1,6 @@
 # rwkv-rs-test
 
-本仓库为rwkv的推理框架和训练框架提供完整的单元测试套件和基准测试套件. 
+本仓库为rwkv的推理框架和训练框架提供完整的单元测试套件和基准测试套件.
 
 1. 导出激活值的目录结构契约如下, 生成数据用于单元测试.
 
@@ -321,53 +321,108 @@ def trace(output_path: str | Path, filename: str, tensor: torch.Tensor) -> None:
 ```
 
 3. 给各 repo 加 trace 插桩，运行规则统一：
-  - 训练 repo：只跑 1 个真实 train step，完成该 step 的激活导出后退出 (L12-D768-CTX512-BSZ16)
-  - 推理 repo：只跑 1 个真实 prefill step，完成该 prefill 的激活导出后退出。(weights/rwkv7-g1f-1.5b-20260419-ctx8192.pth, 以及rwkv7-g1f-1.5b-*.gguf)
-  - rwkv-peft 只跑 pretrain 路径，不是 LoRA / state tuning / SFT。
-  - 所有 repo 使用同一个环境变量，例如：
 
-  RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen
-  RWKV_TRACE_ONCE=1
+- 训练 repo：只跑 1 个真实 train step，完成该 step 的激活导出后退出 (L12-D768-CTX512-BSZ16)
+- 推理 repo：只跑 1 个真实 prefill step，完成该 prefill 的激活导出后退出。(weights/rwkv7-g1f-1.5b-20260419-ctx8192.pth, 以及rwkv7-g1f-1.5b-\*.gguf)
+- rwkv-peft 只跑 pretrain 路径，不是 LoRA / state tuning / SFT。
+- 所有 repo 使用同一个环境变量，例如：
 
-  RWKV_TRACE_ROOT 负责指定导出根目录；RWKV_TRACE_ONCE=1 表示开启 trace，并在导出第一个完整训练 step 或第一个完整 prefill step 后退出。
+RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen
+RWKV_TRACE_ONCE=1
 
-  - trace 行为：
-      - 输出目录仍为 test_gen/<repo_name>/<quantization_name>/case_000000/...。
-      - RWKV_TRACE_ONCE 在所有 repo 中语义一致：只导出第一个 case，然后立刻结束当前真实运行流程。
-      - 训练侧不要在 forward 中途退出；必须等 training_step 完成 loss 计算，必要时等 Lightning 完成当前 batch step，再停止 trainer。
-      - 推理侧不要进入 decode loop；prefill logits 导出完成后退出。
-  - 训练 repo：
-      - rwkv-lm：继续用原 train.py + DataLoader + trainer.fit，数据来自 data/minipile.bin/.idx。在第一个 training_step 的 forward 中导出
-        所有 README 激活点，step 完成后通过 RWKV_TRACE_ONCE 停止训练。
-      - rwkv-peft：使用 train.py 的 pretrain 配置，明确传：
-        --peft none --data_type binidx --data_file ../../data/minipile --my_testing x070
-        不使用 scripts/lora.sh、scripts/state tuning.sh、run_sft.sh 的 PEFT 参数。插桩位置是 rwkvt/rwkv7/model.py、block.py、att.py、ffn.py，退出点放在 Lightning training_step / callback 层，保证只完成 1 个 train step。
-  - 推理 repo：
-      - albatross / rwkv-lightning：用现有 benchmark.py 或 demo 入口，调用真实 tokenizer 和 model.forward(prompt_tokens, state)。只导出prompt prefill，不进入后续 token decode 循环。
-      - nano-vllm：在真实 scheduler / ModelRunner.run_logits(..., is_prefill=True) 路径导出第一个 prefill batch，完成后退出，不跑decode。
-      - web-rwkv：用现有 example/runtime infer 入口，通过 hook 读取第一个 prefill chunk 的激活，导出后退出。
-      - llama.cpp / rwkv-mobile：通过真实 llama_decode / backend eval prefill 路径导出 graph tensor；第一个 prefill 完成后退出，不继续采样生成。
-      - prompt 统一设为 "User: You are a very talented expert in aime24. Solve the problem and output the final answer in \\boxed{}. Problem: Let AB​CD be a tetrahedron such that AB = CD = \\sqrt{41}, AC = BD = \\sqrt{80}, and BC = AD = \\sqrt{89}. There exists a point I inside the tetrahedron such that the distances from I to each of the faces of the tetrahedron are all equal. This distance can be written in the form \\frac{m\\sqrt{n}}{p}, where m, n, and p are positive integers, m and p are relatively prime, and n is not divisible by the square of any prime. Find m + n + p. Assistant: <think"
+RWKV_TRACE_ROOT 负责指定导出根目录；RWKV_TRACE_ONCE=1 表示开启 trace，并在导出第一个完整训练 step 或第一个完整 prefill step 后退出。
 
-  ## 启动命令默认
-  - rwkv-lm：
-    cd train-repo/rwkv-lm
-    RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen RWKV_TRACE_ONCE=1 bash demo-training-run.sh
-  - rwkv-peft pretrain：
-    cd train-repo/rwkv-peft
-    RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen RWKV_TRACE_ONCE=1 \
-    python train.py --load_model "" --proj_dir out_trace --data_file ../../data/minipile \
-      --vocab_size 65536 --data_type binidx --n_layer <N> --n_embd <D> \
-      --ctx_len <T> --micro_bsz <B> --epoch_steps 1 --epoch_count 1 \
-      --accelerator gpu --precision bf16 --devices 1 --strategy auto \
-      --my_testing x070 --peft none
-  - 推理 repo：
-      - 用各自现有 benchmark/demo/server 入口。
-      - 设置同样的：
-        RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen
-        RWKV_TRACE_ONCE=1
-      - 入口检测到 RWKV_TRACE_ONCE=1 后，只执行第一个真实 prefill，并在导出后结束进程或返回主函数。
+- trace 行为：
+    - 输出目录仍为 test_gen/<repo_name>/<quantization_name>/case_000000/...。
+    - RWKV_TRACE_ONCE 在所有 repo 中语义一致：只导出第一个 case，然后立刻结束当前真实运行流程。
+    - 训练侧不要在 forward 中途退出；必须等 training_step 完成 loss 计算，必要时等 Lightning 完成当前 batch step，再停止 trainer。
+    - 推理侧不要进入 decode loop；prefill logits 导出完成后退出。
+- 训练 repo：
+    - rwkv-lm：继续用原 train.py + DataLoader + trainer.fit，数据来自 data/minipile.bin/.idx。在第一个 training_step 的 forward 中导出
+      所有 README 激活点，step 完成后通过 RWKV_TRACE_ONCE 停止训练。
+    - rwkv-peft：使用 train.py 的 pretrain 配置，明确传：
+      --peft none --data_type binidx --data_file ../../data/minipile --my_testing x070
+      不使用 scripts/lora.sh、scripts/state tuning.sh、run_sft.sh 的 PEFT 参数。插桩位置是 rwkvt/rwkv7/model.py、block.py、att.py、ffn.py，退出点放在 Lightning training_step / callback 层，保证只完成 1 个 train step。
+- 推理 repo：
+    - albatross / rwkv-lightning：用现有 benchmark.py 或 demo 入口，调用真实 tokenizer 和 model.forward(prompt_tokens, state)。只导出prompt prefill，不进入后续 token decode 循环。
+    - nano-vllm：在真实 scheduler / ModelRunner.run_logits(..., is_prefill=True) 路径导出第一个 prefill batch，完成后退出，不跑decode。
+    - web-rwkv：用现有 example/runtime infer 入口，通过 hook 读取第一个 prefill chunk 的激活，导出后退出。
+    - llama.cpp / rwkv-mobile：通过真实 llama_decode / backend eval prefill 路径导出 graph tensor；第一个 prefill 完成后退出，不继续采样生成。
+    - prompt 统一设为 "User: You are a very talented expert in aime24. Solve the problem and output the final answer in \\boxed{}. Problem: Let AB​CD be a tetrahedron such that AB = CD = \\sqrt{41}, AC = BD = \\sqrt{80}, and BC = AD = \\sqrt{89}. There exists a point I inside the tetrahedron such that the distances from I to each of the faces of the tetrahedron are all equal. This distance can be written in the form \\frac{m\\sqrt{n}}{p}, where m, n, and p are positive integers, m and p are relatively prime, and n is not divisible by the square of any prime. Find m + n + p. Assistant: <think"
 
-4. 在G:\Projects\Packages\rwkv-rs-stable\crates\rwkv-test设计CLI工具, 导入两个目录路径, 一个是待测的导出数据的根, 另一个是baseline导出数据的根, 按照1中所设计的契约读取safetensor, 和baseline对比绝对误差, 相对误差, 以及向量相似度; 
+## 启动命令默认
+
+- rwkv-lm：
+  cd train-repo/rwkv-lm
+  RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen RWKV_TRACE_ONCE=1 bash demo-training-run.sh
+- rwkv-peft pretrain：
+  cd train-repo/rwkv-peft
+  RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen RWKV_TRACE_ONCE=1 \
+  python train.py --load_model "" --proj_dir out_trace --data_file ../../data/minipile \
+   --vocab_size 65536 --data_type binidx --n_layer <N> --n_embd <D> \
+   --ctx_len <T> --micro_bsz <B> --epoch_steps 1 --epoch_count 1 \
+   --accelerator gpu --precision bf16 --devices 1 --strategy auto \
+   --my_testing x070 --peft none
+- 推理 repo：
+    - 用各自现有 benchmark/demo/server 入口。
+    - 设置同样的：
+      RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen
+      RWKV_TRACE_ONCE=1
+    - 入口检测到 RWKV_TRACE_ONCE=1 后，只执行第一个真实 prefill，并在导出后结束进程或返回主函数。
+
+4. rwkv-test CLI
+   rwkv-test 应该做成一个很薄的对比工具，放在 /mnt/g/Projects/Packages/rwkv-rs-stable/crates/rwkv-test/src/main.rs
+   输入待测 trace 根目录和 baseline trace 根目录，按 README 的 safetensors 契约逐文件对比 abs error、relative error、cosine similarity。这个工具不应该很大。核心实现 150 行左右合理；加上 CLI、错误信息、阈值和表格输出，大概 220-300 行。
+
+- Cargo.toml 添加最少依赖：clap, anyhow, safetensors, half
+- Example:
+- ```
+  cargo run -p rwkv-test -- compare\
+    --actual /path/to/test_gen/albatross/fp16/case_000000 \
+    --baseline /path/to/test_gen/rwkv_lm/bf16/case_000000 \
+    --atol 1e-3 --rtol 1e-2 --cos-min 0.999
+  ```
+
+```
+- 输入目录不硬编码 repo 名、量化名或层数递归扫描 actual 下所有 .safetensors
+- 用相对路径去 baseline 找同名文件
+- 忽略 *.time.json
+- 对 extra/missing 文件报错
+- 这样可以自然支持 cell_0000..cell_N 和不同 engine 的目录差异检查
+
+- 每个 .safetensors 文件必须满足 README 契约：
+    - 文件里只有一个 tensor
+    - tensor 名等于文件 stem，例如 logits.safetensors 内 tensor 名为 logits
+    - baseline 和 actual 的 dtype、shape、元素个数必须一致，否则直接失败
+- tensor 统一转成 f64 做统计：
+    - 支持 F64/F32/F16/BF16
+    - I64/I32/I16/I8/U64/U32/U16/U8/BOOL 也可转成 f64，主要用于 token_ids
+    - 不支持 safetensors 新增的 packed/FP8/MX 类型，遇到时给清晰错误
+- 每个 tensor 输出：
+    - max_abs
+    - mean_abs
+    - max_rel = max(abs(a-b) / max(abs(b), eps))
+    - mean_rel
+    - cosine = dot(a,b) / (norm(a)*norm(b))
+    - count
+- 失败规则：
+    - shape/dtype/missing/extra 文件直接失败
+    - 数值文件若 max_abs > atol && max_rel > rtol 则失败
+    - cosine < cos_min 则失败
+    - token_ids 这类整数 tensor 建议要求完全一致，也就是任何 abs diff 都失败
+- 默认输出人类可读表格，按 max_abs 或失败项排序：
+  status path                                      dtype shape        max_abs  max_rel  cosine
+  PASS   lm_head/logits.safetensors               F16   [1,512,...]  3.1e-4   8.2e-3   0.99998
+  FAIL   cells/cell_0003/time_mixer/embedded...   F16   [1,512,768]  1.7e-2   2.4e-1   0.99120
+- 最后输出 summary：
+  compared=84 passed=83 failed=1 missing=0 extra=0
+  worst_abs=...
+  worst_rel=...
+  worst_cosine=...
+- 退出码：
+  - 0：全部通过
+  - 1：存在数值差异或契约不匹配
+  - 2：CLI 参数、文件读取、safetensors 解析错误
 
 5. 运行不同的推理引擎, [1]记录它们各自的吞吐量Prefill TokenPerSecond和Decode TokenPerSecond [2] 记录延迟指标: TTFT, E2EL, TokenGenerationTime(E2EL-TTFT),TimePerOutputToken(TokenGenerationTime/(token数-1)), ITL, 分位数延迟 . 并且绘制出图像来对比不同的推理后端(需要选择合适的绘图形式来清晰对比).
+```
