@@ -441,6 +441,7 @@ RWKV_TRACE_ROOT 负责指定导出根目录；RWKV_TRACE_ONCE=1 表示开启 tra
 - bsz = [1, 16, 64, 128, 256, 512, 1024]
 - prompt_len = [16, 256, 512, 1024, 4096]
 - decode_len = 16
+- 数据使用: https://huggingface.co/datasets/openai/gsm8k
 - 允许 warmup
 - 每个仓库输出统一 CSV，并添加绘图脚本
 
