@@ -320,7 +320,53 @@ def trace(output_path: str | Path, filename: str, tensor: torch.Tensor) -> None:
 # trace(case_root, "cells/cell_0000/time_mixer/embedded_context.safetensors", x)
 ```
 
-3. 所有数据都需要是真实训练和推理过程中导出的, 不可以自己建立任何的服务于导出数据的程序入口, 只可以添加插桩, rwkv-lm和rwkv-peft均有Dataloader, 需要复用, 使用data目录下的binidx, 这同样也是rwkv-lm和rwkv-peft所默认使用的训练数据,无需更改任何脚本参数就能运行; 
+3. 给各 repo 加 trace 插桩，运行规则统一：
+  - 训练 repo：只跑 1 个真实 train step，完成该 step 的激活导出后退出 (L12-D768-CTX512-BSZ16)
+  - 推理 repo：只跑 1 个真实 prefill step，完成该 prefill 的激活导出后退出。(weights/rwkv7-g1e-1.5b-20260309-ctx8192.pth)
+  - rwkv-peft 只跑 pretrain 路径，不是 LoRA / state tuning / SFT。
+  - 所有 repo 使用同一个环境变量，例如：
+
+  RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen
+  RWKV_TRACE_ONCE=1
+
+  RWKV_TRACE_ROOT 负责指定导出根目录；RWKV_TRACE_ONCE=1 表示开启 trace，并在导出第一个完整训练 step 或第一个完整 prefill step 后退出。
+
+  - trace 行为：
+      - 输出目录仍为 test_gen/<repo_name>/<quantization_name>/case_000000/...。
+      - RWKV_TRACE_ONCE 在所有 repo 中语义一致：只导出第一个 case，然后立刻结束当前真实运行流程。
+      - 训练侧不要在 forward 中途退出；必须等 training_step 完成 loss 计算，必要时等 Lightning 完成当前 batch step，再停止 trainer。
+      - 推理侧不要进入 decode loop；prefill logits 导出完成后退出。
+  - 训练 repo：
+      - rwkv-lm：继续用原 train.py + DataLoader + trainer.fit，数据来自 data/minipile.bin/.idx。在第一个 training_step 的 forward 中导出
+        所有 README 激活点，step 完成后通过 RWKV_TRACE_ONCE 停止训练。
+      - rwkv-peft：使用 train.py 的 pretrain 配置，明确传：
+        --peft none --data_type binidx --data_file ../../data/minipile --my_testing x070
+        不使用 scripts/lora.sh、scripts/state tuning.sh、run_sft.sh 的 PEFT 参数。插桩位置是 rwkvt/rwkv7/model.py、block.py、att.py、ffn.py，退出点放在 Lightning training_step / callback 层，保证只完成 1 个 train step。
+  - 推理 repo：
+      - albatross / rwkv-lightning：用现有 benchmark.py 或 demo 入口，调用真实 tokenizer 和 model.forward(prompt_tokens, state)。只导出prompt prefill，不进入后续 token decode 循环。
+      - nano-vllm：在真实 scheduler / ModelRunner.run_logits(..., is_prefill=True) 路径导出第一个 prefill batch，完成后退出，不跑decode。
+      - web-rwkv：用现有 example/runtime infer 入口，通过 hook 读取第一个 prefill chunk 的激活，导出后退出。
+      - llama.cpp / rwkv-mobile：通过真实 llama_decode / backend eval prefill 路径导出 graph tensor；第一个 prefill 完成后退出，不继续采样生成。
+      - prompt 统一设为 "User: You are a very talented expert in aime24. Solve the problem and output the final answer in \\boxed{}. Problem: Let AB​CD be a tetrahedron such that AB = CD = \\sqrt{41}, AC = BD = \\sqrt{80}, and BC = AD = \\sqrt{89}. There exists a point I inside the tetrahedron such that the distances from I to each of the faces of the tetrahedron are all equal. This distance can be written in the form \\frac{m\\sqrt{n}}{p}, where m, n, and p are positive integers, m and p are relatively prime, and n is not divisible by the square of any prime. Find m + n + p. Assistant: <think"
+
+  ## 启动命令默认
+  - rwkv-lm：
+    cd train-repo/rwkv-lm
+    RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen RWKV_TRACE_ONCE=1 bash demo-training-run.sh
+  - rwkv-peft pretrain：
+    cd train-repo/rwkv-peft
+    RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen RWKV_TRACE_ONCE=1 \
+    python train.py --load_model "" --proj_dir out_trace --data_file ../../data/minipile \
+      --vocab_size 65536 --data_type binidx --n_layer <N> --n_embd <D> \
+      --ctx_len <T> --micro_bsz <B> --epoch_steps 1 --epoch_count 1 \
+      --accelerator gpu --precision bf16 --devices 1 --strategy auto \
+      --my_testing x070 --peft none
+  - 推理 repo：
+      - 用各自现有 benchmark/demo/server 入口。
+      - 设置同样的：
+        RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen
+        RWKV_TRACE_ONCE=1
+      - 入口检测到 RWKV_TRACE_ONCE=1 后，只执行第一个真实 prefill，并在导出后结束进程或返回主函数。
 
 4. 在G:\Projects\Packages\rwkv-rs-stable\crates\rwkv-test设计CLI工具, 导入两个目录路径, 一个是待测的导出数据的根, 另一个是baseline导出数据的根, 按照1中所设计的契约读取safetensor, 和baseline对比绝对误差, 相对误差, 以及向量相似度; 
 
