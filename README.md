@@ -322,7 +322,7 @@ def trace(output_path: str | Path, filename: str, tensor: torch.Tensor) -> None:
 
 3. 给各 repo 加 trace 插桩，运行规则统一：
   - 训练 repo：只跑 1 个真实 train step，完成该 step 的激活导出后退出 (L12-D768-CTX512-BSZ16)
-  - 推理 repo：只跑 1 个真实 prefill step，完成该 prefill 的激活导出后退出。(weights/rwkv7-g1e-1.5b-20260309-ctx8192.pth)
+  - 推理 repo：只跑 1 个真实 prefill step，完成该 prefill 的激活导出后退出。(weights/rwkv7-g1f-1.5b-20260419-ctx8192.pth, 以及rwkv7-g1f-1.5b-*.gguf)
   - rwkv-peft 只跑 pretrain 路径，不是 LoRA / state tuning / SFT。
   - 所有 repo 使用同一个环境变量，例如：
 
