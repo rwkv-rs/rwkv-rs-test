@@ -5,6 +5,7 @@ import lightning as pl
 import json
 from rwkvt.trick.lrs import wsd,cos_decay
 import copy
+from rwkvt.trace import enabled as trace_enabled
 
         
 class train_callback(pl.Callback):
@@ -129,6 +130,9 @@ class train_callback(pl.Callback):
                         lll["kt/s"] = kt_s
                     trainer.my_wandb.log(lll, step=int(trainer.global_step))
                 self.write_data(trainer.my_loss, t_cost, kt_s)
+
+        if trace_enabled() and getattr(pl_module, "_rwkv_trace_step_done", False):
+            trainer.should_stop = True
 
             # if trainer.global_step % 2000 == 0:
             #     to_save_dict = pl_module.state_dict()

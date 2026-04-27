@@ -7,6 +7,7 @@ from rwkvt.infctx_module import *
 
 from rwkvt.operator.rwkvop import RUN_CUDA_RWKV7g, RUN_RWKV7_STATE, RUN_RWKV7_INFCTX
 from torch.nn import functional as F
+from rwkvt.trace import trace_cell
 
 if os.environ["FUSED_KERNEL"] == '1':
     from rwkvfla.ops.rwkv7 import fused_addcmul_rwkv7
@@ -165,6 +166,7 @@ class RWKV_Tmix_x070(nn.Module):
             v_first = v # store the v of the first layer
         else:
             v = v + (v_first - v) * torch.sigmoid(self.v0 + (xv @ self.v1) @ self.v2) # add value residual
+        trace_cell(self.layer_id, "time_mixer/value_from_first_cell.safetensors", v_first)
         a = torch.sigmoid(self.a0 + (xa @ self.a1) @ self.a2) # a is "in-context learning rate"
         g = torch.sigmoid(xg @ self.g1) @ self.g2
 
@@ -180,6 +182,7 @@ class RWKV_Tmix_x070(nn.Module):
 
         x = x + ((r.view(B,T,H,-1)*k.view(B,T,H,-1)*self.r_k).sum(dim=-1, keepdim=True) * v.view(B,T,H,-1)).view(B,T,C)
         x = self.output(x * g)
+        trace_cell(self.layer_id, "time_mixer/embedded_context.safetensors", x)
         return x, v_first
   
 

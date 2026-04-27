@@ -14,6 +14,7 @@ from torch.nn import functional as F
 from lightning_utilities.core.rank_zero import rank_zero_info, rank_zero_only
 import lightning as pl
 from lightning.pytorch.strategies import DeepSpeedStrategy
+from rwkvt.trace import enabled as trace_enabled
 if importlib.util.find_spec('deepspeed'):
     import deepspeed
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
@@ -239,8 +240,10 @@ class RWKV(pl.LightningModule):
                 idx, targets = batch
                 logits = self(idx)
             loss = self.criterion(logits.view(-1, logits.size(-1)), targets.view(-1))
-            
-            return L2Wrap.apply(loss, logits)
+            loss = L2Wrap.apply(loss, logits)
+            if trace_enabled():
+                self._rwkv_trace_step_done = True
+            return loss
     
     
     def training_step_end(self, batch_parts):
