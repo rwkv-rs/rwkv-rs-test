@@ -52,6 +52,11 @@ class RequestMetrics:
     server_request_setup_ms: float | None = None
     server_response_build_ms: float | None = None
     server_app_ms: float | None = None
+    itl_mean_ms: float | None = None
+    itl_p50_ms: float | None = None
+    itl_p90_ms: float | None = None
+    itl_p95_ms: float | None = None
+    itl_p99_ms: float | None = None
 
 
 @dataclass
@@ -85,16 +90,20 @@ class BenchmarkSummary:
     server_request_setup_ms: dict[str, float] | None = None
     server_response_build_ms: dict[str, float] | None = None
     server_app_ms: dict[str, float] | None = None
+    client_itl_ms: dict[str, float] | None = None
+
+
+PromptInput = str | list[int]
 
 
 class PromptSource:
-    def __init__(self, prompts: list[str], seed: int):
+    def __init__(self, prompts: list[PromptInput], seed: int):
         if not prompts:
             raise ValueError("No prompts available for the benchmark.")
         self.prompts = prompts
         self.rng = random.Random(seed)
 
-    def sample(self, request_index: int) -> str:
+    def sample(self, request_index: int) -> PromptInput:
         if len(self.prompts) == 1:
             return self.prompts[0]
         return self.prompts[self.rng.randrange(len(self.prompts))]
@@ -226,6 +235,30 @@ def summarize_distribution(values: list[float], scale: float = 1.0) -> dict[str,
     }
 
 
+def summarize_itl_ms(token_arrival_s: list[float]) -> dict[str, float | None]:
+    if len(token_arrival_s) < 2:
+        return {
+            "itl_mean_ms": None,
+            "itl_p50_ms": None,
+            "itl_p90_ms": None,
+            "itl_p95_ms": None,
+            "itl_p99_ms": None,
+        }
+    intervals_ms = [
+        (token_arrival_s[index] - token_arrival_s[index - 1]) * 1000.0
+        for index in range(1, len(token_arrival_s))
+    ]
+    dist = summarize_distribution(intervals_ms)
+    assert dist is not None
+    return {
+        "itl_mean_ms": dist["mean"],
+        "itl_p50_ms": dist["p50"],
+        "itl_p90_ms": dist["p90"],
+        "itl_p95_ms": dist["p95"],
+        "itl_p99_ms": dist["p99"],
+    }
+
+
 def parse_float_header(headers: httpx.Headers, name: str) -> float | None:
     value = headers.get(name)
     if value is None:
@@ -257,13 +290,15 @@ def build_payload(
     *,
     endpoint: str,
     model: str,
-    prompt: str,
+    prompt: PromptInput,
     system_prompt: str | None,
     max_tokens: int,
     temperature: float,
     stream: bool,
 ) -> dict[str, Any]:
     if endpoint == "chat":
+        if not isinstance(prompt, str):
+            raise ValueError("chat endpoint requires text prompts")
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -275,13 +310,17 @@ def build_payload(
             "temperature": temperature,
             "stream": stream,
         }
-    return {
+    payload = {
         "model": model,
-        "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": stream,
     }
+    if isinstance(prompt, str):
+        payload["prompt"] = prompt
+    else:
+        payload["prompt_token_ids"] = prompt
+    return payload
 
 
 def parse_sync_body(endpoint: str, body: dict[str, Any]) -> tuple[int, str, str | None]:
@@ -441,6 +480,7 @@ async def run_stream_request(
     server_request_setup_ms = None
     server_response_build_ms = None
     server_app_ms = None
+    token_arrival_s: list[float] = []
     try:
         async with client.stream("POST", url, headers=headers, json=payload) as response:
             request_id = response.headers.get("x-request-id")
@@ -515,11 +555,16 @@ async def run_stream_request(
                 else:
                     text_delta = choice.get("text") or ""
                 if text_delta and ttft_s is None:
-                    ttft_s = time.perf_counter() - started_at
+                    arrived_at = time.perf_counter() - started_at
+                    ttft_s = arrived_at
+                    token_arrival_s.append(arrived_at)
+                elif text_delta:
+                    token_arrival_s.append(time.perf_counter() - started_at)
                 response_chars += len(text_delta)
             latency_s = time.perf_counter() - started_at
             if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
                 total_tokens = prompt_tokens + completion_tokens
+            itl = summarize_itl_ms(token_arrival_s)
             return RequestMetrics(
                 request_index=request_index,
                 worker_id=worker_id,
@@ -546,9 +591,11 @@ async def run_stream_request(
                 server_request_setup_ms=server_request_setup_ms,
                 server_response_build_ms=server_response_build_ms,
                 server_app_ms=server_app_ms,
+                **itl,
             )
     except Exception as exc:
         latency_s = time.perf_counter() - started_at
+        itl = summarize_itl_ms(token_arrival_s)
         return RequestMetrics(
             request_index=request_index,
             worker_id=worker_id,
@@ -575,6 +622,7 @@ async def run_stream_request(
             server_request_setup_ms=server_request_setup_ms,
             server_response_build_ms=server_response_build_ms,
             server_app_ms=server_app_ms,
+            **itl,
         )
 
 
@@ -773,6 +821,13 @@ def summarize_metrics(
         server_app_ms=summarize_distribution(
             [metric.server_app_ms for metric in metrics if metric.server_app_ms is not None]
         ),
+        client_itl_ms=summarize_distribution(
+            [
+                metric.itl_mean_ms
+                for metric in metrics
+                if metric.ok and metric.itl_mean_ms is not None
+            ]
+        ),
     )
 
 
@@ -819,6 +874,7 @@ def print_summary(summary: BenchmarkSummary) -> None:
     print_distribution("server_request_setup_ms", summary.server_request_setup_ms, "ms")
     print_distribution("server_response_build_ms", summary.server_response_build_ms, "ms")
     print_distribution("server_app_ms", summary.server_app_ms, "ms")
+    print_distribution("client_itl_ms", summary.client_itl_ms, "ms")
     print_distribution("server_output_tps", summary.server_output_tps, "")
     print_distribution("server_decode_tps", summary.server_decode_tps, "")
     if summary.sample_errors:
@@ -891,8 +947,8 @@ def write_request_csv(path: str, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def load_prompts(prompt_file: str | None, inline_prompts: list[str], prompt_repeat: int) -> list[str]:
-    prompts = list(inline_prompts)
+def load_prompts(prompt_file: str | None, inline_prompts: list[str], prompt_repeat: int) -> list[PromptInput]:
+    prompts: list[PromptInput] = list(inline_prompts)
     if prompt_file:
         path = Path(prompt_file)
         if path.suffix == ".jsonl":
@@ -903,6 +959,11 @@ def load_prompts(prompt_file: str | None, inline_prompts: list[str], prompt_repe
                 record = json.loads(line)
                 if "prompt" in record:
                     prompts.append(str(record["prompt"]))
+                elif "prompt_token_ids" in record:
+                    token_ids = record["prompt_token_ids"]
+                    if not isinstance(token_ids, list) or not all(isinstance(token_id, int) for token_id in token_ids):
+                        raise ValueError("prompt_token_ids must be a JSON list of integers")
+                    prompts.append(token_ids)
                 elif "text" in record:
                     prompts.append(str(record["text"]))
         else:
@@ -917,6 +978,11 @@ def load_prompts(prompt_file: str | None, inline_prompts: list[str], prompt_repe
 
 
 async def run_single_benchmark(args) -> tuple[BenchmarkSummary, list[RequestMetrics]]:
+    args.load_mode = getattr(args, "load_mode", "closed-loop")
+    args.arrival_rate = getattr(args, "arrival_rate", 32.0)
+    args.max_in_flight = getattr(args, "max_in_flight", 0)
+    args.max_connections = getattr(args, "max_connections", None)
+    args.max_keepalive_connections = getattr(args, "max_keepalive_connections", None)
     total_requests = args.total_requests
     if total_requests is None and args.duration is None:
         total_requests = 100

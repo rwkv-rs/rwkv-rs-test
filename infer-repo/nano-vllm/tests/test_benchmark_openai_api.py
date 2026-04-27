@@ -40,6 +40,15 @@ class BenchmarkOpenAIAPIHelpersTest(unittest.TestCase):
             temperature=0.0,
             stream=False,
         )
+        completion_token_ids_payload = bench.build_payload(
+            endpoint="completions",
+            model="rwkv-test",
+            prompt=[1, 2, 3],
+            system_prompt=None,
+            max_tokens=8,
+            temperature=0.0,
+            stream=True,
+        )
 
         self.assertEqual(
             chat_payload,
@@ -64,6 +73,16 @@ class BenchmarkOpenAIAPIHelpersTest(unittest.TestCase):
                 "stream": False,
             },
         )
+        self.assertEqual(
+            completion_token_ids_payload,
+            {
+                "model": "rwkv-test",
+                "prompt_token_ids": [1, 2, 3],
+                "max_tokens": 8,
+                "temperature": 0.0,
+                "stream": True,
+            },
+        )
 
     def test_parse_sync_body_for_chat_and_completions(self):
         completion = {
@@ -83,6 +102,7 @@ class BenchmarkOpenAIAPIHelpersTest(unittest.TestCase):
             jsonl_path = Path(tmpdir) / "prompts.jsonl"
             jsonl_path.write_text(
                 json.dumps({"prompt": "c"}, ensure_ascii=False) + "\n"
+                + json.dumps({"prompt_token_ids": [1, 2, 3]}, ensure_ascii=False) + "\n"
                 + json.dumps({"text": "d"}, ensure_ascii=False) + "\n",
                 encoding="utf-8",
             )
@@ -92,8 +112,15 @@ class BenchmarkOpenAIAPIHelpersTest(unittest.TestCase):
             default_prompts = bench.load_prompts(None, [], 1)
 
         self.assertEqual(txt_prompts, ["inline", "a", "b", "inline", "a", "b"])
-        self.assertEqual(jsonl_prompts, ["c", "d"])
+        self.assertEqual(jsonl_prompts, ["c", [1, 2, 3], "d"])
         self.assertEqual(default_prompts, bench.DEFAULT_PROMPTS)
+
+    def test_summarize_itl_ms(self):
+        itl = bench.summarize_itl_ms([0.01, 0.03, 0.06])
+
+        self.assertAlmostEqual(itl["itl_mean_ms"], 25.0)
+        self.assertAlmostEqual(itl["itl_p50_ms"], 25.0)
+        self.assertAlmostEqual(itl["itl_p95_ms"], 29.5)
 
     def test_summarize_metrics_and_build_metric_records(self):
         stats = bench.StatsCollector()

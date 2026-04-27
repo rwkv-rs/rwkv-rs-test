@@ -42,6 +42,7 @@ def run_benchmark(
     rwkv_int8_fp16_lm_head: bool = False,
     enforce_eager: bool = False,
     seed: int = 0,
+    prompt_tokens: list[int] | None = None,
 ) -> tuple[int, int, int, int, float, float, float, float | None]:
     (
         rwkv_quant_int8_lm_head,
@@ -73,9 +74,16 @@ def run_benchmark(
         rwkv_int8_fp16_lm_head=rwkv_int8_fp16_lm_head,
     )
     vocab_size = int(llm.model_runner.config.model_config.vocab_size)
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(seed)
-    prompt_tokens = torch.randint(0, vocab_size, (prompt_length,), generator=generator, dtype=torch.int64).tolist()
+    if prompt_tokens is None:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
+        prompt_tokens = torch.randint(0, vocab_size, (prompt_length,), generator=generator, dtype=torch.int64).tolist()
+    else:
+        prompt_tokens = [int(token_id) for token_id in prompt_tokens]
+        if len(prompt_tokens) != prompt_length:
+            raise ValueError(
+                f"prompt_tokens length {len(prompt_tokens)} does not match prompt_length {prompt_length}"
+            )
     if concurrency == -1:
         concurrency = llm.model_runner.config.num_state_blocks
     llm.model_runner.sampler.forward = lambda logits, temperatures: logits.argmax(dim=-1)
