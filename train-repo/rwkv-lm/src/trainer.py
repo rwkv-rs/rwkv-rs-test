@@ -3,6 +3,7 @@ import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
+from .trace import enabled as trace_enabled
 
 def my_save(args, trainer, dd, ff):
     if 'deepspeed_stage_3' in args.strategy:
@@ -106,6 +107,9 @@ class train_callback(pl.Callback):
                 if kt_s > 0:
                     lll["kt/s"] = kt_s
                 trainer.my_wandb.log(lll, step=int(real_step))
+
+        if trace_enabled() and getattr(pl_module, "_rwkv_trace_step_done", False):
+            trainer.should_stop = True
 
         if (trainer.is_global_zero) or ('deepspeed_stage_3' in args.strategy): # save pth
             if args.magic_prime > 0:

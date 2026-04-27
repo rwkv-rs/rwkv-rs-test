@@ -104,7 +104,7 @@ if __name__ == "__main__":
     args.epoch_steps = 40320 // args.real_bsz
     assert args.epoch_steps * args.real_bsz == 40320
 
-    if args.train_stage >= 2:  # find latest saved model
+    if args.train_stage >= 2 and len(args.load_model) > 0:  # find latest saved model
         list_p = []
         for p in os.listdir(args.proj_dir):
             if p.startswith("rwkv") and p.endswith(".pth"):
@@ -173,6 +173,9 @@ if __name__ == "__main__":
         rank_zero_info("\n\nNote: you are using fp16 (might overflow). Try bf16 / tf32 for stable training.\n\n")
 
     os.environ["RWKV_JIT_ON"] = "1"
+    if os.environ.get("RWKV_TRACE_ONCE") == "1":
+        args.grad_cp = 0
+        os.environ["RWKV_JIT_ON"] = "0"
     if "deepspeed_stage_3" in args.strategy:
         os.environ["RWKV_JIT_ON"] = "0" # somehow incompatible
 

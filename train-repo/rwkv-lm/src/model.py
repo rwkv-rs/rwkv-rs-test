@@ -9,6 +9,7 @@ from torch.nn import functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
 from pytorch_lightning.strategies import DeepSpeedStrategy
+from .trace import enabled as trace_enabled, trace, trace_cell
 if importlib.util.find_spec('deepspeed'):
     import deepspeed
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
@@ -134,7 +135,7 @@ torch.library.register_autograd(
     setup_context=_setup_context,
 )
 
-def _forward_op(x, x_r, x_w, x_k, x_v, x_a, x_g):
+def _tmix_mix6_bf16_v5_forward_op(x, x_r, x_w, x_k, x_v, x_a, x_g):
     return torch.ops.rwkv7_tmix_mix6_bf16_v5.forward(
         x.contiguous(),
         x_r.contiguous(),
@@ -163,7 +164,7 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_mix6_bf16_v5_jit(x, x_r, x_w, x_k, x_v, x_a, x_g)
 else:
     def tmix_mix6_bf16_v5(x, x_r, x_w, x_k, x_v, x_a, x_g):
-        return tuple(_forward_op(x, x_r, x_w, x_k, x_v, x_a, x_g))
+        return tuple(_tmix_mix6_bf16_v5_forward_op(x, x_r, x_w, x_k, x_v, x_a, x_g))
 
 ########################################################################################################
 
@@ -202,7 +203,7 @@ torch.library.register_autograd(
     setup_context=_setup_context,
 )
 
-def _forward_op(k, k_k, a, k_a):
+def _tmix_kk_pre_bf16_v5_forward_op(k, k_k, a, k_a):
     outs = torch.ops.rwkv7_tmix_kk_pre_bf16_v5.forward(
         k.contiguous(),
         k_k.contiguous(),
@@ -233,7 +234,7 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_kk_pre_bf16_v5_jit(k, k_k, a, k_a)
 else:
     def tmix_kk_pre_bf16_v5(k, k_k, a, k_a):
-        return tuple(_forward_op(k, k_k, a, k_a))
+        return tuple(_tmix_kk_pre_bf16_v5_forward_op(k, k_k, a, k_a))
 
 ########################################################################################################
 
@@ -270,7 +271,7 @@ torch.library.register_autograd(
     setup_context=_setup_context,
 )
 
-def _forward_op(x, r, k, v, r_k, weight, bias, g):
+def _tmix_lnx_rkvres_xg_bf16_v1_forward_op(x, r, k, v, r_k, weight, bias, g):
     outs = torch.ops.rwkv7_tmix_lnx_rkvres_xg_bf16_v1.forward(
         x.contiguous(),
         r.contiguous(),
@@ -311,7 +312,7 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_lnx_rkvres_xg_bf16_v1_jit(x, r, k, v, r_k, weight, bias, g)
 else:
     def tmix_lnx_rkvres_xg_bf16_v1(x, r, k, v, r_k, weight, bias, g):
-        return _forward_op(x, r, k, v, r_k, weight, bias, g)
+        return _tmix_lnx_rkvres_xg_bf16_v1_forward_op(x, r, k, v, r_k, weight, bias, g)
 
 ########################################################################################################
 
@@ -338,7 +339,7 @@ torch.library.register_autograd(
     setup_context=_setup_context,
 )
 
-def _forward_op(a0, a12):
+def _tmix_a_gate_bf16_forward_op(a0, a12):
     return torch.ops.rwkv7_tmix_a_gate_bf16.forward(
         a0.contiguous(),
         a12.contiguous(),
@@ -359,7 +360,7 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_a_gate_bf16_jit(a0, a12)
 else:
     def tmix_a_gate_bf16(a0, a12):
-        return _forward_op(a0, a12)
+        return _tmix_a_gate_bf16_forward_op(a0, a12)
 
 ########################################################################################################
 
@@ -390,7 +391,7 @@ torch.library.register_autograd(
     setup_context=_setup_context,
 )
 
-def _forward_op(v, v_first, v0, v12):
+def _tmix_vres_gate_bf16_v1_forward_op(v, v_first, v0, v12):
     return torch.ops.rwkv7_tmix_vres_gate_bf16_v1.forward(
         v.contiguous(),
         v_first.contiguous(),
@@ -417,7 +418,7 @@ if os.environ.get("RWKV_JIT_ON") == "1":
         return _tmix_vres_gate_bf16_v1_jit(v, v_first, v0, v12)
 else:
     def tmix_vres_gate_bf16_v1(v, v_first, v0, v12):
-        return _forward_op(v, v_first, v0, v12)
+        return _tmix_vres_gate_bf16_v1_forward_op(v, v_first, v0, v12)
 
 ########################################################################################################
 
@@ -581,6 +582,7 @@ class RWKV_Tmix_x070(MyModule):
             v12 = (xv @ self.v1) @ self.v2
             v = tmix_vres_gate_bf16_v1(v, v_first, self.v0, v12) # add value residual
             ############################################################
+        trace_cell(self.layer_id, "time_mixer/value_from_first_cell.safetensors", v_first)
 
         ############################################################
         # slow pytorch version
@@ -627,6 +629,7 @@ class RWKV_Tmix_x070(MyModule):
                 g,
         )
         x = self.output(x)
+        trace_cell(self.layer_id, "time_mixer/embedded_context.safetensors", x)
         ############################################################
 
         return x, v_first
@@ -706,11 +709,20 @@ class Block(nn.Module):
     def forward(self, x, v_first):
         if self.layer_id == 0:
             x = self.ln0(x)
+            trace("layer_norm0/embedded_context.safetensors", x)
 
-        x_attn, v_first = self.att(self.ln1(x), v_first)
+        x_tmix = self.ln1(x)
+        trace_cell(self.layer_id, "pre_layer_norm_for_time_mix/embedded_context.safetensors", x_tmix)
+        x_attn, v_first = self.att(x_tmix, v_first)
         x = x + x_attn
+        trace_cell(self.layer_id, "embedded_context_after_time_mixer.safetensors", x)
 
-        x = x + self.ffn(self.ln2(x))
+        x_cmix = self.ln2(x)
+        trace_cell(self.layer_id, "pre_layer_norm_for_channel_mix/embedded_context.safetensors", x_cmix)
+        x_ffn = self.ffn(x_cmix)
+        trace_cell(self.layer_id, "channel_mixer/embedded_context.safetensors", x_ffn)
+        x = x + x_ffn
+        trace_cell(self.layer_id, "embedded_context_after_channel_mixer.safetensors", x)
         return x, v_first
 
 
@@ -802,7 +814,9 @@ class RWKV(pl.LightningModule):
         B, T = idx.size()
         assert T <= args.ctx_len, "Cannot forward, model ctx_len is exhausted."
 
+        trace("embedding/token_ids.safetensors", idx)
         x = self.emb(idx)
+        trace("embedding/embedded_context.safetensors", x)
 
         v_first = torch.empty_like(x)
         for block in self.blocks:
@@ -812,7 +826,9 @@ class RWKV(pl.LightningModule):
                 x, v_first = block(x, v_first)
 
         x = self.ln_out(x)
+        trace("lm_head/embedded_context.safetensors", x)
         x = self.head(x)
+        trace("lm_head/logits.safetensors", x)
         return x
 
     def training_step(self, batch, batch_idx):
@@ -825,7 +841,10 @@ class RWKV(pl.LightningModule):
         # return L2Wrap.apply(loss, logits)
         ############################################################
         # much faster CUDA version (!!! fixed vocab 65536 and fixed 1e-4 factor !!!)
-        return l2wrap_cross_entropy(logits, targets)
+        loss = l2wrap_cross_entropy(logits, targets)
+        if trace_enabled():
+            self._rwkv_trace_step_done = True
+        return loss
 
     def training_step_end(self, batch_parts):
         all = self.all_gather(batch_parts)

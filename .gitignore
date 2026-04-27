@@ -1,3 +1,4 @@
 /data
 /weights
 /test_gen
+/train-repo/rwkv-peft/out_trace

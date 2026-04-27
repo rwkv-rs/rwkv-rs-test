@@ -1,0 +1,15 @@
+[project]
+name = "rwkv-lm-trace"
+version = "0.1.0"
+description = "RWKV-LM trace export environment"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "deepspeed",
+    "ninja",
+    "numpy",
+    "pytorch-lightning==1.9.5",
+    "safetensors",
+    "torch",
+    "wandb",
+]
+
