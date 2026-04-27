@@ -3,3 +3,4 @@
 /test_gen
 /train-repo/rwkv-peft/out_trace
 /infer-repo/nano-vllm/results
+/infer-repo/llama.cpp/results

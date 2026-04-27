@@ -1,5 +1,14 @@
 #include "models.h"
 
+#include <cstdio>
+#include <string>
+
+static std::string rwkv7_trace_node_name(int il, const char * suffix) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "rwkv.%02d.%s", il, suffix);
+    return std::string(buf);
+}
+
 llm_build_rwkv7::llm_build_rwkv7(const llama_model & model, const llm_graph_params & params) :
     llm_build_rwkv7_base(model, params) {
     GGML_ASSERT(hparams.token_shift_count == 2);
@@ -9,7 +18,9 @@ llm_build_rwkv7::llm_build_rwkv7(const llama_model & model, const llm_graph_para
     ggml_tensor * v_first = nullptr;
 
     inpL = build_inp_embd(model.tok_embd);
+    cb(inpL, "rwkv.embedding", -1);
     inpL = build_norm(inpL, model.tok_norm, model.tok_norm_b, LLM_NORM, 0);
+    cb(inpL, "rwkv.ln0", -1);
 
     auto * rs_inp = build_rs_inp();
 
@@ -31,19 +42,20 @@ llm_build_rwkv7::llm_build_rwkv7(const llama_model & model, const llm_graph_para
                                                token_shift->nb[2], n_embd * ggml_element_size(token_shift));
 
         ggml_tensor * att_norm = build_norm(inpL, layer->attn_norm, layer->attn_norm_b, LLM_NORM, il);
-        cb(att_norm, "attn_norm", il);
+        cb(att_norm, rwkv7_trace_node_name(il, "t_ln").c_str(), -1);
 
         ggml_tensor * x_prev = ggml_concat(
             ctx0, att_shift,
             ggml_view_3d(ctx0, att_norm, n_embd, n_seq_tokens - 1, n_seqs, att_norm->nb[1], att_norm->nb[2], 0), 1);
 
         cur = build_rwkv7_time_mix(rs_inp, att_norm, x_prev, v_first, ubatch, il);
+        cb(cur, rwkv7_trace_node_name(il, "tmix").c_str(), -1);
 
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
-        cb(ffn_inp, "ffn_inp", il);
+        cb(ffn_inp, rwkv7_trace_node_name(il, "after_tmix").c_str(), -1);
 
         ggml_tensor * ffn_norm = build_norm(ffn_inp, layer->attn_norm_2, layer->attn_norm_2_b, LLM_NORM, il);
-        cb(ffn_norm, "ffn_norm", il);
+        cb(ffn_norm, rwkv7_trace_node_name(il, "c_ln").c_str(), -1);
 
         x_prev = ggml_concat(
             ctx0, ffn_shift,
@@ -67,10 +79,11 @@ llm_build_rwkv7::llm_build_rwkv7(const llama_model & model, const llm_graph_para
             x_prev   = ggml_get_rows(ctx0, x_prev, inp_out_ids);
         }
         cur = build_rwkv7_channel_mix(layer, ffn_norm, x_prev, LLM_ARCH_RWKV7);
+        cb(cur, rwkv7_trace_node_name(il, "cmix").c_str(), -1);
         cur = ggml_add(ctx0, cur, ffn_inp);
 
         cur = build_cvec(cur, il);
-        cb(cur, "l_out", il);
+        cb(cur, rwkv7_trace_node_name(il, "after_cmix").c_str(), -1);
 
         // input for next layer
         inpL = cur;
@@ -78,12 +91,12 @@ llm_build_rwkv7::llm_build_rwkv7(const llama_model & model, const llm_graph_para
     cur = inpL;
     cur = build_norm(cur, model.output_norm, model.output_norm_b, LLM_NORM, -1);
 
-    cb(cur, "result_norm", -1);
+    cb(cur, "rwkv.lm_embd", -1);
     res->t_embd = cur;
 
     cur = build_lora_mm(model.output, cur);
 
-    cb(cur, "result_output", -1);
+    cb(cur, "rwkv.logits", -1);
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);

@@ -2,6 +2,15 @@
 
 #include "llama-memory-recurrent.h"
 
+#include <cstdio>
+#include <string>
+
+static std::string rwkv7_trace_base_node_name(int il, const char * suffix) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "rwkv.%02d.%s", il, suffix);
+    return std::string(buf);
+}
+
 llm_build_rwkv7_base::llm_build_rwkv7_base(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params),
     model(model) {}
@@ -82,6 +91,10 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
                                                                        ggml_mul_mat(ctx0, layer.time_mix_v1, xv)),
                                                           layer.time_mix_v0))));
     }
+    ggml_tensor * first_layer_value_trace = ggml_cont(ctx0, first_layer_value);
+    cb(first_layer_value_trace, rwkv7_trace_base_node_name(il, "v_first").c_str(), -1);
+    ggml_build_forward_expand(gf, first_layer_value_trace);
+
     ggml_tensor * g = nullptr;
     if (layer.time_mix_g1 && layer.time_mix_g2) {
         g = ggml_mul_mat(ctx0, layer.time_mix_g2, ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, layer.time_mix_g1, xg)));
