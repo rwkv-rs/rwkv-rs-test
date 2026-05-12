@@ -33,6 +33,7 @@ __global__ void forward_kernel_preload(int T,int H,F_ r_,F_ w_,F_ k_,F_ v_,F_ a_
     __shared__ float r[_CHUNK_LEN_][N];
     __shared__ float w[_CHUNK_LEN_][N];
     __shared__ float k[_CHUNK_LEN_][N];
+    __shared__ float v[_CHUNK_LEN_][N];
     __shared__ float a[_CHUNK_LEN_][N];
     __shared__ float b[_CHUNK_LEN_][N];
 
@@ -45,6 +46,7 @@ __global__ void forward_kernel_preload(int T,int H,F_ r_,F_ w_,F_ k_,F_ v_,F_ a_
             r[tt][i] = to_float(r_[idx]);
             w[tt][i] = __expf(W_SCALE / (1.0f + __expf(-to_float(w_[idx]))));
             k[tt][i] = to_float(k_[idx]);
+            v[tt][i] = to_float(v_[idx]);
             a[tt][i] = to_float(a_[idx]);
             b[tt][i] = to_float(b_[idx]);
         }
@@ -60,7 +62,7 @@ __global__ void forward_kernel_preload(int T,int H,F_ r_,F_ w_,F_ k_,F_ v_,F_ a_
             }
             sa_[idx] = sa;
 
-            float vi = to_float(v_[idx]);
+            float vi = v[tt][i];
             float y=0.0f;
 #pragma unroll
             for (int j=0; j<N; ++j) {

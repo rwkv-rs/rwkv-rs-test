@@ -41,8 +41,10 @@ if TRACE_ENABLED:
     MyFunction = __nop
     MyStatic = __nop
 
+from .trace import measure
+
 if TRACE_ENABLED:
-    from .trace import case_root, trace_tensor, trace_token_ids
+    from .trace import trace_tensor, trace_token_ids
 
 DTYPE = torch.half
 HEAD_SIZE = 64
@@ -230,7 +232,10 @@ class RWKV_x070(MyModule):
     def forward(self, idx, state, full_output=False, with_sampling=False): # will modify state in-place
         if type(idx) is list:
             if len(idx) > 1:
-                return self.forward_seq(torch.tensor(idx), state, full_output)
+                idx_tensor = torch.tensor(idx)
+                if TRACE_ENABLED:
+                    return self.forward_seq_trace(idx_tensor, state, full_output)
+                return self.forward_seq(idx_tensor, state, full_output)
             else:
                 x = self.z['emb.weight'][idx[0]]
                 return self.forward_one(x, state, with_sampling)
@@ -252,6 +257,8 @@ class RWKV_x070(MyModule):
     def forward_batch_same_length(self, tokens, state, full_output=False):
         assert type(tokens) is list
         assert len(set([len(x) for x in tokens])) == 1, 'here all sequences must have the same length'
+        if TRACE_ENABLED:
+            return self.forward_seq_batch_trace(tokens, state, full_output)
         return self.forward_seq_batch(tokens, state, full_output)
 
     @MyFunction
@@ -293,12 +300,6 @@ class RWKV_x070(MyModule):
         with torch.no_grad(): 
             z = self.z
             x = z['emb.weight'][idx]
-            if TRACE_ENABLED:
-                trace_token_ids(idx)
-                raw_x = z['emb.weight.raw'][idx]
-                trace_tensor("embedding/embedded_context.safetensors", raw_x.contiguous())
-                trace_tensor("layer_norm0/embedded_context.safetensors", x.contiguous())
-
             v_first = torch.empty_like(x)
             for i in range(self.n_layer):
                 bbb = f'blocks.{i}.'
@@ -306,39 +307,77 @@ class RWKV_x070(MyModule):
                 ffn = f'blocks.{i}.ffn.'
 
                 xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln1.weight'], bias=z[bbb+'ln1.bias'])
-                if TRACE_ENABLED:
-                    trace_tensor(f"cells/cell_{i:04d}/pre_layer_norm_for_time_mix/embedded_context.safetensors", xx.contiguous())
                 xx, v_first = RWKV_x070_TMix_seq(i, self.n_head, self.head_size, xx, state[3*i], v_first, state[3*i+1],
                     z[att+'x_r'], z[att+'x_w'], z[att+'x_k'], z[att+'x_v'], z[att+'x_a'], z[att+'x_g'],
                     z[att+'w0'], z[att+'w1'], z[att+'w2'], z[att+'a0'], z[att+'a1'], z[att+'a2'], z[att+'v0'], z[att+'v1'], z[att+'v2'],
                     z[att+'g1'], z[att+'g2'], z[att+'k_k'], z[att+'k_a'], z[att+'r_k'],
                     z[att+'receptance.weight'], z[att+'key.weight'], z[att+'value.weight'], z[att+'output.weight'],
                     z[att+'ln_x.weight'], z[att+'ln_x.bias'], state[3*self.n_layer])
-                if TRACE_ENABLED:
-                    trace_tensor(f"cells/cell_{i:04d}/time_mixer/value_from_first_cell.safetensors", v_first.contiguous())
-                    trace_tensor(f"cells/cell_{i:04d}/time_mixer/embedded_context.safetensors", xx.contiguous())
                 x = x + xx
-                if TRACE_ENABLED:
-                    trace_tensor(f"cells/cell_{i:04d}/embedded_context_after_time_mixer.safetensors", x.contiguous())
 
                 xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln2.weight'], bias=z[bbb+'ln2.bias'])
-                if TRACE_ENABLED:
-                    trace_tensor(f"cells/cell_{i:04d}/pre_layer_norm_for_channel_mix/embedded_context.safetensors", xx.contiguous())
 
                 xx = RWKV_x070_CMix_seq(xx, state[3*i+2], z[ffn+'x_k'], z[ffn+'key.weight'], z[ffn+'value.weight'])
-                if TRACE_ENABLED:
-                    trace_tensor(f"cells/cell_{i:04d}/channel_mixer/embedded_context.safetensors", xx.contiguous())
                 x = x + xx
-                if TRACE_ENABLED:
-                    trace_tensor(f"cells/cell_{i:04d}/embedded_context_after_channel_mixer.safetensors", x.contiguous())
             
             if not full_output: x = x[-1,:]
             x = F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias'])
-            if TRACE_ENABLED:
-                trace_tensor("lm_head/embedded_context.safetensors", x.contiguous())
             x = F.linear(x, z['head.weight'])
+            # state[2] += len(idx)
+            state[3*self.n_layer] += len(idx)
+            return x
+
+    def forward_seq_trace(self, idx:torch.Tensor, state:List[torch.Tensor], full_output:bool=False):
+        with torch.no_grad(): 
+            z = self.z
+            x, embedding_elapsed_ns = measure(lambda: z['emb.weight'][idx], idx)
             if TRACE_ENABLED:
-                trace_tensor("lm_head/logits.safetensors", x.contiguous())
+                trace_token_ids(idx)
+                raw_x, raw_embedding_elapsed_ns = measure(lambda: z['emb.weight.raw'][idx], idx)
+                trace_tensor("embedding/embedded_context.safetensors", raw_x.contiguous(), raw_embedding_elapsed_ns)
+                trace_tensor("layer_norm0/embedded_context.safetensors", x.contiguous(), embedding_elapsed_ns)
+
+            v_first = torch.empty_like(x)
+            for i in range(self.n_layer):
+                bbb = f'blocks.{i}.'
+                att = f'blocks.{i}.att.'
+                ffn = f'blocks.{i}.ffn.'
+
+                xx, elapsed_ns = measure(lambda: F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln1.weight'], bias=z[bbb+'ln1.bias']), x)
+                if TRACE_ENABLED:
+                    trace_tensor(f"cells/cell_{i:04d}/pre_layer_norm_for_time_mix/embedded_context.safetensors", xx.contiguous(), elapsed_ns)
+                (xx, v_first), elapsed_ns = measure(lambda: RWKV_x070_TMix_seq(i, self.n_head, self.head_size, xx, state[3*i], v_first, state[3*i+1],
+                    z[att+'x_r'], z[att+'x_w'], z[att+'x_k'], z[att+'x_v'], z[att+'x_a'], z[att+'x_g'],
+                    z[att+'w0'], z[att+'w1'], z[att+'w2'], z[att+'a0'], z[att+'a1'], z[att+'a2'], z[att+'v0'], z[att+'v1'], z[att+'v2'],
+                    z[att+'g1'], z[att+'g2'], z[att+'k_k'], z[att+'k_a'], z[att+'r_k'],
+                    z[att+'receptance.weight'], z[att+'key.weight'], z[att+'value.weight'], z[att+'output.weight'],
+                    z[att+'ln_x.weight'], z[att+'ln_x.bias'], state[3*self.n_layer]), xx, v_first)
+                if TRACE_ENABLED:
+                    v_first_trace, v_first_elapsed_ns = measure(lambda: v_first.contiguous().clone(), v_first)
+                    trace_tensor(f"cells/cell_{i:04d}/time_mixer/value_from_first_cell.safetensors", v_first_trace, v_first_elapsed_ns)
+                    trace_tensor(f"cells/cell_{i:04d}/time_mixer/embedded_context.safetensors", xx.contiguous(), elapsed_ns)
+                x, elapsed_ns = measure(lambda: x + xx, x, xx)
+                if TRACE_ENABLED:
+                    trace_tensor(f"cells/cell_{i:04d}/embedded_context_after_time_mixer.safetensors", x.contiguous(), elapsed_ns)
+
+                xx, elapsed_ns = measure(lambda: F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln2.weight'], bias=z[bbb+'ln2.bias']), x)
+                if TRACE_ENABLED:
+                    trace_tensor(f"cells/cell_{i:04d}/pre_layer_norm_for_channel_mix/embedded_context.safetensors", xx.contiguous(), elapsed_ns)
+
+                xx, elapsed_ns = measure(lambda: RWKV_x070_CMix_seq(xx, state[3*i+2], z[ffn+'x_k'], z[ffn+'key.weight'], z[ffn+'value.weight']), xx)
+                if TRACE_ENABLED:
+                    trace_tensor(f"cells/cell_{i:04d}/channel_mixer/embedded_context.safetensors", xx.contiguous(), elapsed_ns)
+                x, elapsed_ns = measure(lambda: x + xx, x, xx)
+                if TRACE_ENABLED:
+                    trace_tensor(f"cells/cell_{i:04d}/embedded_context_after_channel_mixer.safetensors", x.contiguous(), elapsed_ns)
+            
+            if not full_output: x = x[-1,:]
+            x, elapsed_ns = measure(lambda: F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias']), x)
+            if TRACE_ENABLED:
+                trace_tensor("lm_head/embedded_context.safetensors", x.contiguous(), elapsed_ns)
+            x, elapsed_ns = measure(lambda: F.linear(x, z['head.weight']), x)
+            if TRACE_ENABLED:
+                trace_tensor("lm_head/logits.safetensors", x.contiguous(), elapsed_ns)
             # state[2] += len(idx)
             state[3*self.n_layer] += len(idx)
             return x
@@ -349,12 +388,6 @@ class RWKV_x070(MyModule):
             z = self.z
             idx_tensor = torch.tensor(idxs, device=z['emb.weight'].device)
             x = z['emb.weight'][idx_tensor]
-            if TRACE_ENABLED:
-                trace_token_ids(idx_tensor)
-                raw_x = z['emb.weight.raw'][idx_tensor]
-                trace_tensor("embedding/embedded_context.safetensors", raw_x.contiguous())
-                trace_tensor("layer_norm0/embedded_context.safetensors", x.contiguous())
-
             v_first = torch.empty_like(x)
             for i in range(self.n_layer):
                 bbb = f'blocks.{i}.'
@@ -362,39 +395,77 @@ class RWKV_x070(MyModule):
                 ffn = f'blocks.{i}.ffn.'
 
                 xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln1.weight'], bias=z[bbb+'ln1.bias'])
-                if TRACE_ENABLED:
-                    trace_tensor(f"cells/cell_{i:04d}/pre_layer_norm_for_time_mix/embedded_context.safetensors", xx.contiguous())
                 xx, v_first = RWKV_x070_TMix_seq_batch(i, self.n_head, self.head_size, xx, state[3*i], v_first, state[3*i+1],
                     z[att+'x_r'], z[att+'x_w'], z[att+'x_k'], z[att+'x_v'], z[att+'x_a'], z[att+'x_g'],
                     z[att+'w0'], z[att+'w1'], z[att+'w2'], z[att+'a0'], z[att+'a1'], z[att+'a2'], z[att+'v0'], z[att+'v1'], z[att+'v2'],
                     z[att+'g1'], z[att+'g2'], z[att+'k_k'], z[att+'k_a'], z[att+'r_k'],
                     z[att+'receptance.weight'], z[att+'key.weight'], z[att+'value.weight'], z[att+'output.weight'],
                     z[att+'ln_x.weight'], z[att+'ln_x.bias'], state[3*self.n_layer])
-                if TRACE_ENABLED:
-                    trace_tensor(f"cells/cell_{i:04d}/time_mixer/value_from_first_cell.safetensors", v_first.contiguous())
-                    trace_tensor(f"cells/cell_{i:04d}/time_mixer/embedded_context.safetensors", xx.contiguous())
                 x = x + xx
-                if TRACE_ENABLED:
-                    trace_tensor(f"cells/cell_{i:04d}/embedded_context_after_time_mixer.safetensors", x.contiguous())
 
                 xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln2.weight'], bias=z[bbb+'ln2.bias'])
-                if TRACE_ENABLED:
-                    trace_tensor(f"cells/cell_{i:04d}/pre_layer_norm_for_channel_mix/embedded_context.safetensors", xx.contiguous())
 
                 xx = RWKV_x070_CMix_seq_batch(xx, state[3*i+2], z[ffn+'x_k'], z[ffn+'key.weight'], z[ffn+'value.weight'])
-                if TRACE_ENABLED:
-                    trace_tensor(f"cells/cell_{i:04d}/channel_mixer/embedded_context.safetensors", xx.contiguous())
                 x = x + xx
-                if TRACE_ENABLED:
-                    trace_tensor(f"cells/cell_{i:04d}/embedded_context_after_channel_mixer.safetensors", x.contiguous())
             
             if not full_output: x = x[:,-1,:]
             x = F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias'])
-            if TRACE_ENABLED:
-                trace_tensor("lm_head/embedded_context.safetensors", x.contiguous())
             x = F.linear(x, z['head.weight'])
+            state[3*self.n_layer] += len(idxs[0])
+            return x
+
+    def forward_seq_batch_trace(self, idxs:List[List[int]], state:List[torch.Tensor], full_output:bool=False):
+        with torch.no_grad(): 
+            z = self.z
+            idx_tensor = torch.tensor(idxs, device=z['emb.weight'].device)
+            x, embedding_elapsed_ns = measure(lambda: z['emb.weight'][idx_tensor], idx_tensor)
             if TRACE_ENABLED:
-                trace_tensor("lm_head/logits.safetensors", x.contiguous())
+                trace_token_ids(idx_tensor)
+                raw_x, raw_embedding_elapsed_ns = measure(lambda: z['emb.weight.raw'][idx_tensor], idx_tensor)
+                trace_tensor("embedding/embedded_context.safetensors", raw_x.contiguous(), raw_embedding_elapsed_ns)
+                trace_tensor("layer_norm0/embedded_context.safetensors", x.contiguous(), embedding_elapsed_ns)
+
+            v_first = torch.empty_like(x)
+            for i in range(self.n_layer):
+                bbb = f'blocks.{i}.'
+                att = f'blocks.{i}.att.'
+                ffn = f'blocks.{i}.ffn.'
+
+                xx, elapsed_ns = measure(lambda: F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln1.weight'], bias=z[bbb+'ln1.bias']), x)
+                if TRACE_ENABLED:
+                    trace_tensor(f"cells/cell_{i:04d}/pre_layer_norm_for_time_mix/embedded_context.safetensors", xx.contiguous(), elapsed_ns)
+                (xx, v_first), elapsed_ns = measure(lambda: RWKV_x070_TMix_seq_batch(i, self.n_head, self.head_size, xx, state[3*i], v_first, state[3*i+1],
+                    z[att+'x_r'], z[att+'x_w'], z[att+'x_k'], z[att+'x_v'], z[att+'x_a'], z[att+'x_g'],
+                    z[att+'w0'], z[att+'w1'], z[att+'w2'], z[att+'a0'], z[att+'a1'], z[att+'a2'], z[att+'v0'], z[att+'v1'], z[att+'v2'],
+                    z[att+'g1'], z[att+'g2'], z[att+'k_k'], z[att+'k_a'], z[att+'r_k'],
+                    z[att+'receptance.weight'], z[att+'key.weight'], z[att+'value.weight'], z[att+'output.weight'],
+                    z[att+'ln_x.weight'], z[att+'ln_x.bias'], state[3*self.n_layer]), xx, v_first)
+                if TRACE_ENABLED:
+                    v_first_trace, v_first_elapsed_ns = measure(lambda: v_first.contiguous().clone(), v_first)
+                    trace_tensor(f"cells/cell_{i:04d}/time_mixer/value_from_first_cell.safetensors", v_first_trace, v_first_elapsed_ns)
+                    trace_tensor(f"cells/cell_{i:04d}/time_mixer/embedded_context.safetensors", xx.contiguous(), elapsed_ns)
+                x, elapsed_ns = measure(lambda: x + xx, x, xx)
+                if TRACE_ENABLED:
+                    trace_tensor(f"cells/cell_{i:04d}/embedded_context_after_time_mixer.safetensors", x.contiguous(), elapsed_ns)
+
+                xx, elapsed_ns = measure(lambda: F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln2.weight'], bias=z[bbb+'ln2.bias']), x)
+                if TRACE_ENABLED:
+                    trace_tensor(f"cells/cell_{i:04d}/pre_layer_norm_for_channel_mix/embedded_context.safetensors", xx.contiguous(), elapsed_ns)
+
+                xx, elapsed_ns = measure(lambda: RWKV_x070_CMix_seq_batch(xx, state[3*i+2], z[ffn+'x_k'], z[ffn+'key.weight'], z[ffn+'value.weight']), xx)
+                if TRACE_ENABLED:
+                    trace_tensor(f"cells/cell_{i:04d}/channel_mixer/embedded_context.safetensors", xx.contiguous(), elapsed_ns)
+                x, elapsed_ns = measure(lambda: x + xx, x, xx)
+                if TRACE_ENABLED:
+                    trace_tensor(f"cells/cell_{i:04d}/embedded_context_after_channel_mixer.safetensors", x.contiguous(), elapsed_ns)
+            
+            if not full_output: x = x[:,-1,:]
+            x, elapsed_ns = measure(lambda: F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias']), x)
+            if TRACE_ENABLED:
+                trace_tensor("lm_head/embedded_context.safetensors", x.contiguous(), elapsed_ns)
+            x, elapsed_ns = measure(lambda: F.linear(x, z['head.weight']), x)
+            if TRACE_ENABLED:
+                trace_tensor("lm_head/logits.safetensors", x.contiguous(), elapsed_ns)
             state[3*self.n_layer] += len(idxs[0])
             return x
     

@@ -56,10 +56,51 @@ test_gen
 - `channel_mixer/embedded_context` 是 CMix 残差分支输出。
 - `embedded_context_after_channel_mixer` 是当前 cell 输出，也是下一层 cell 输入。
 - `lm_head/embedded_context` 是 LMHead 输入，`lm_head/logits` 是 LMHead 输出。
+- 训练 trace 和推理 trace 的导出集合不同。训练 trace 必须仍然从原训练入口跑一个真实
+  `training_step`，但测试目标是训练路径 custom CUDA kernel 的输出，而不是推理式 logits
+  对齐。
+- `lm_head/logits` 只属于推理 prefill 或显式 logits 对齐 case；`rwkv_lm` 训练 trace 不要求导出 `lm_head/logits`。
+- `rwkv_lm` 训练 trace 至少导出 custom kernel 主输出：
+  `cells/cell_*/time_mixer/embedded_context.safetensors`、
+  `cells/cell_*/channel_mixer/embedded_context.safetensors`、
+  `loss/l2wrap_cross_entropy.safetensors`。启用 `--head_chunk > 0` 时，训练 trace 改为导出
+  `loss/head_l2wrap_cross_entropy.safetensors` 作为 fused head+CE kernel 主输出。
+- 一个 CUDA kernel 返回多个 tensor 时，所有导出的 tensor 都必须写同一个真实 kernel compute
+  边界耗时；测试/汇总层可以只选择主输出做性能聚合，但不得通过给辅助输出写 `0` 来避免重复汇总。
 
 ## 插桩函数设计
 
-以下是提供的插桩函数设计，直接复制到 repo 中调用完成数据和耗时的导出。
+以下是提供的插桩函数设计，直接复制到 repo 中调用完成数据导出。
+
+`*.time.json` 的 `elapsed_ns` 只允许记录产生该 tensor 的被测 compute 区间耗时。不要在
+trace/export helper 内部计时；不要把 GPU readback、CPU copy、safetensors 序列化或文件
+写入算进去；也不要把整段 prefill / train step 的耗时挂到某个中间 tensor 上。
+
+只要为某个被测输出写了插桩代码，就必须保证该输出的 `elapsed_ns` 来自正确的 compute
+边界和必要的设备同步。不会正确计时就不要写成 `0` 冒充有效 trace；该后端必须修正计时
+实现，或把对应测项标记为 unsupported 并拒绝产出 timing 结果。`elapsed_ns=0` 不是
+“测不了时的占位方案”，只能用于确实没有 compute 区间的输入元数据。
+
+`elapsed_ns` 必须写平均耗时，不允许写单次运行的总耗时。平均口径是同一原始程序入口、
+同一输入、同一模型、同一设备同步边界下，跳过 `warmup` 次完整 trace run 后，对 `repeat`
+次完整 trace run 中同名 `.time.json` 的有效 `elapsed_ns` 做算术平均：
+
+```text
+elapsed_ns = round(sum(samples_ns) / repeat)
+```
+
+平均只跨完整 trace run，不在模型 forward 内重复执行某个子模块，也不按 token、batch
+element、hidden size 或输出元素数再除一次。每个 `.time.json` 必须同时写入：
+
+- `elapsed_ns`：平均后的 ns。
+- `repeat`：参与平均的有效 trace run 数。
+- `warmup`：未参与平均的预热 trace run 数。
+- `samples_ns`：参与平均的每次完整 trace run 原始样本。
+
+`elapsed_ns=0` 只允许用于确实没有被测 compute 区间的输入元数据，例如
+`embedding/token_ids.safetensors`。别名/透传 tensor、辅助输出和 unsupported 测项不得
+靠写 `0` 通过 timing 契约；需要保留数值 trace 时，应在测试/汇总层显式排除其 timing，
+或修正为可验证的真实计时。
 
 ### Rust
 
@@ -67,7 +108,6 @@ test_gen
 use std::{
     fs::{create_dir_all, write},
     path::Path,
-    time::Instant,
 };
 
 use burn::prelude::{Backend, Tensor};
@@ -92,7 +132,10 @@ fn write_trace_time(path: &Path, filename: &str, elapsed_ns: u128) {
     time_path.set_extension("time.json");
     write(
         time_path,
-        format!(r#"{{"filename":"{}","elapsed_ns":{}}}"#, filename, elapsed_ns),
+        format!(
+            r#"{{"filename":"{}","elapsed_ns":{},"repeat":1,"warmup":0,"samples_ns":[{}]}}"#,
+            filename, elapsed_ns, elapsed_ns
+        ),
     )
     .unwrap();
 }
@@ -123,28 +166,31 @@ fn burn_dtype_to_safetensors_dtype(dtype: BurnDType) -> SafeDtype {
 }
 
 // for webgpu based by web-rwkv
-fn trace_webgpu<T, K>(output_path: &Path, filename: &str, tensor: TensorGpu<T, K>)
+fn trace_webgpu<T, K>(output_path: &Path, filename: &str, tensor: TensorGpu<T, K>, elapsed_ns: u128)
 where
     T: Scalar,
     K: Kind,
 {
     let path = output_path.join(filename);
-    let start = Instant::now();
     let cpu = tensor.back_in_place();
     let shape: [usize; 4] = cpu.shape().into();
     let bytes = bytemuck::cast_slice(cpu.data().as_ref());
     write_safetensor(&path, tensor_name(filename), T::DATA_TYPE, shape.to_vec(), bytes);
-    write_trace_time(&path, filename, start.elapsed().as_nanos());
+    write_trace_time(&path, filename, elapsed_ns);
 }
 
 // for burn based by rwkv-rs
-fn trace_burn<B, const D: usize, K>(output_path: &Path, filename: &str, tensor: Tensor<B, D, K>)
+fn trace_burn<B, const D: usize, K>(
+    output_path: &Path,
+    filename: &str,
+    tensor: Tensor<B, D, K>,
+    elapsed_ns: u128,
+)
 where
     B: Backend,
     K: TensorKind<B>,
 {
     let path = output_path.join(filename);
-    let start = Instant::now();
     let data = tensor.into_data();
     let dtype = burn_dtype_to_safetensors_dtype(data.dtype);
     let shape = data.shape.clone();
@@ -156,12 +202,14 @@ where
         shape,
         bytes,
     );
-    write_trace_time(&path, filename, start.elapsed().as_nanos());
+    write_trace_time(&path, filename, elapsed_ns);
 }
 
 // usage:
-// trace_webgpu(case_root, "cells/cell_0000/time_mixer/embedded_context.safetensors", x);
-// trace_burn(case_root, "cells/cell_0000/time_mixer/embedded_context.safetensors", x);
+// let start = Instant::now();
+// let y = run_time_mixer(x);
+// let elapsed_ns = start.elapsed().as_nanos();
+// trace_webgpu(case_root, "cells/cell_0000/time_mixer/embedded_context.safetensors", y, elapsed_ns);
 ```
 
 ### C++
@@ -192,7 +240,8 @@ static void write_trace_time(
     auto time_path = path;
     time_path.replace_extension("time.json");
     std::ofstream out(time_path);
-    out << "{\"filename\":\"" << filename << "\",\"elapsed_ns\":" << elapsed_ns << "}";
+    out << "{\"filename\":\"" << filename << "\",\"elapsed_ns\":" << elapsed_ns
+        << ",\"repeat\":1,\"warmup\":0,\"samples_ns\":[" << elapsed_ns << "]}";
 }
 
 static safetensors::dtype ggml_dtype(enum ggml_type type) {
@@ -251,10 +300,10 @@ static void save_safetensor(
 static void trace_ggml(
     const std::filesystem::path & output_path,
     const std::string & filename,
-    const ggml_tensor * tensor
+    const ggml_tensor * tensor,
+    long long elapsed_ns
 ) {
     const auto path = output_path / filename;
-    const auto start = std::chrono::steady_clock::now();
 
     std::vector<size_t> shape;
     for (int i = ggml_n_dims(tensor) - 1; i >= 0; --i) {
@@ -264,19 +313,17 @@ static void trace_ggml(
     std::vector<uint8_t> bytes(ggml_nbytes(tensor));
     ggml_backend_tensor_get(tensor, bytes.data(), 0, bytes.size());
     save_safetensor(path, tensor_name(filename), ggml_dtype(tensor->type), shape, bytes);
-
-    const auto end = std::chrono::steady_clock::now();
-    write_trace_time(path, filename, std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+    write_trace_time(path, filename, elapsed_ns);
 }
 
 // for libtorch
 static void trace_libtorch(
     const std::filesystem::path & output_path,
     const std::string & filename,
-    const torch::Tensor & tensor
+    const torch::Tensor & tensor,
+    long long elapsed_ns
 ) {
     const auto path = output_path / filename;
-    const auto start = std::chrono::steady_clock::now();
 
     TORCH_CHECK(tensor.is_contiguous(), "trace_libtorch requires a contiguous tensor");
     const torch::Tensor host = tensor.device().is_cpu() ? tensor : tensor.cpu();
@@ -290,46 +337,57 @@ static void trace_libtorch(
     const auto * ptr = static_cast<const uint8_t *>(host.const_data_ptr());
     std::vector<uint8_t> bytes(ptr, ptr + nbytes);
     save_safetensor(path, tensor_name(filename), torch_dtype(host.scalar_type()), shape, bytes);
-
-    const auto end = std::chrono::steady_clock::now();
-    write_trace_time(path, filename, std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+    write_trace_time(path, filename, elapsed_ns);
 }
 
 // usage:
-// trace_ggml(case_root, "lm_head/logits.safetensors", logits);
-// trace_libtorch(case_root, "lm_head/logits.safetensors", logits);
+// trace_ggml(case_root, "lm_head/logits.safetensors", logits, lm_head_elapsed_ns);
+// trace_libtorch(case_root, "lm_head/logits.safetensors", logits, lm_head_elapsed_ns);
 ```
+
+llama.cpp 的 `cb_eval` 只能在 scheduler 观察到某个 graph tensor 时回调。用于逐模块耗时
+对比时，计时必须夹在命中 observed node 的 `ask=true` 和对应 `ask=false` 之间，也就是
+记录 scheduler 计算到该 tensor 并同步完成的 graph segment 耗时；不要在
+`trace_ggml` / `trace_bytes` / safetensors 写入 helper 内部计时。旧版
+`test_gen/llama_cpp/fp16/case_000000` 若由写文件 helper 计时生成，其 `.time.json` 只代表
+导出耗时，必须重新导出。
 
 ### Python
 
 ```python
 from pathlib import Path
-from time import perf_counter_ns
 import json
 
 import torch
 from safetensors.torch import save_file
 
 
-def trace(output_path: str | Path, filename: str, tensor: torch.Tensor) -> None:
+def trace(output_path: str | Path, filename: str, tensor: torch.Tensor, elapsed_ns: int) -> None:
     path = Path(output_path) / filename
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    start = perf_counter_ns()
     view = tensor.detach()
     if not view.is_contiguous():
         raise RuntimeError("trace requires a contiguous torch.Tensor")
     save_file({path.stem: view}, path)
-    elapsed_ns = perf_counter_ns() - start
 
     path.with_suffix(".time.json").write_text(
-        json.dumps({"filename": filename, "elapsed_ns": elapsed_ns}),
+        json.dumps(
+            {
+                "filename": filename,
+                "elapsed_ns": elapsed_ns,
+                "repeat": 1,
+                "warmup": 0,
+                "samples_ns": [elapsed_ns],
+            }
+        ),
         encoding="utf-8",
     )
 
 
 # usage:
-# trace(case_root, "cells/cell_0000/time_mixer/embedded_context.safetensors", x)
+# output, elapsed_ns = measure(lambda: time_mixer(x))
+# trace(case_root, "cells/cell_0000/time_mixer/embedded_context.safetensors", output, elapsed_ns)
 ```
 
 ## Trace 运行规则
@@ -337,7 +395,7 @@ def trace(output_path: str | Path, filename: str, tensor: torch.Tensor) -> None:
 给各 repo 加 trace 插桩，运行规则统一：
 
 - 每个 repo 使用 `uv` 管理自己的环境。（训练需要最新版本的 `torch` + 最新版本的 `deepspeed`、`pytorch_lightning==1.9.5`、`ds_bucket_mb=200`。）不要切 `UV_CACHE_DIR` 等缓存目录，遇到沙箱只读问题找用户提权。
-- 训练 repo：只跑 1 个真实 train step，完成该 step 的激活导出后退出（`L12-D768-CTX512-BSZ16`）。
+- 训练 repo：只跑 1 个真实 train step，完成该 step 的训练 kernel 输出和必要激活导出后退出（`L12-D768-CTX512-BSZ16`）。
 - 推理 repo：只跑 1 个真实 prefill step，完成该 prefill 的激活导出后退出。（`weights/rwkv7-g1f-1.5b-20260419-ctx8192.pth`，以及 `rwkv7-g1f-1.5b-*.gguf`。）
 - `rwkv-peft` 只跑 pretrain 路径，不是 LoRA / state tuning / SFT。
 - 所有 repo 使用同一个环境变量，例如：
@@ -348,17 +406,26 @@ RWKV_TRACE_ONCE=1
 ```
 
 `RWKV_TRACE_ROOT` 负责指定导出根目录；`RWKV_TRACE_ONCE=1` 表示开启 trace，并在导出第一个完整训练 step 或第一个完整 prefill step 后退出。
+最终 trace 结果必须通过仓库根目录的平均导出脚本生成：
+
+```bash
+TRACE_REPEAT=3 TRACE_WARMUP=1 bash scripts/export_trace_average.sh
+```
+
+该脚本逐后端运行原有真实入口多次，用仓库内 staging 目录收集中间结果，校验每次导出的
+`.time.json` 集合一致，然后把最后一次 tensor 数据和平均后的 `.time.json` 写回
+`test_gen/<repo_name>/<quantization_name>/case_000000`。
 
 ### Trace 行为
 
 - 输出目录仍为 `test_gen/<repo_name>/<quantization_name>/case_000000/...`。
 - `RWKV_TRACE_ONCE` 在所有 repo 中语义一致：只导出第一个 case，然后立刻结束当前真实运行流程。
-- 训练侧不要在 forward 中途退出；必须等 `training_step` 完成 loss 计算，必要时等 Lightning 完成当前 batch step，再停止 trainer。
+- 训练侧不要在 forward 中途退出；必须等 `training_step` 完成 loss kernel 计算，必要时等 Lightning 完成当前 batch step，再停止 trainer。
 - 推理侧不要进入 decode loop；prefill logits 导出完成后退出。
 
 ### 训练 Repo
 
-- `rwkv-lm`：继续用原 `train.py` + DataLoader + `trainer.fit`，数据来自 `data/minipile.bin/.idx`。在第一个 `training_step` 的 forward 中导出所有 README 激活点，step 完成后通过 `RWKV_TRACE_ONCE` 停止训练。
+- `rwkv-lm`：继续用原 `train.py` + DataLoader + `trainer.fit`，数据来自 `data/minipile.bin/.idx`。在第一个 `training_step` 中导出训练 kernel 输出；不为训练契约强制导出 `lm_head/logits`。step 完成后通过 `RWKV_TRACE_ONCE` 停止训练。
 - `rwkv-peft`：使用 `train.py` 的 pretrain 配置，明确传：
 
 ```bash
@@ -372,6 +439,8 @@ RWKV_TRACE_ONCE=1
 - albatross / rwkv-lightning：用现有 `benchmark.py` 或 demo 入口，调用真实 tokenizer 和 `model.forward(prompt_tokens, state)`。只导出 prompt prefill，不进入后续 token decode 循环。
 - nano-vllm：在真实 scheduler / `ModelRunner.run_logits(..., is_prefill=True)` 路径导出第一个 prefill batch，完成后退出，不跑 decode。
 - web-rwkv：用现有 example/runtime infer 入口，通过 hook 读取第一个 prefill chunk 的激活，导出后退出。
+  `web_rwkv` trace 必须在 Windows WebGPU 环境运行；WSL 里即使 CUDA / `nvidia-smi` 可用，
+  `wgpu` 也可能只能枚举到 llvmpipe CPU adapter，不能作为正式 `web_rwkv` 导出环境。
 - llama.cpp / rwkv-mobile：通过真实 `llama_decode` / backend eval prefill 路径导出 graph tensor；第一个 prefill 完成后退出，不继续采样生成。
 - prompt 统一设为：
 
@@ -388,11 +457,23 @@ cd train-repo/rwkv-lm
 RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen bash trace-train.sh
 ```
 
+上面的命令只用于单次调试。正式结果使用：
+
+```bash
+TRACE_REPEAT=3 TRACE_WARMUP=1 bash scripts/export_trace_average.sh rwkv_lm
+```
+
 ### rwkv-peft pretrain
 
 ```bash
 cd train-repo/rwkv-peft
 RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen bash trace-train.sh
+```
+
+上面的命令只用于单次调试。正式结果使用：
+
+```bash
+TRACE_REPEAT=3 TRACE_WARMUP=1 bash scripts/export_trace_average.sh rwkv_peft
 ```
 
 ### 推理 Repo
@@ -406,6 +487,12 @@ RWKV_TRACE_ONCE=1
 ```
 
 - 入口检测到 `RWKV_TRACE_ONCE=1` 后，只执行第一个真实 prefill，并在导出后结束进程或返回主函数。
+- Linux / WSL 中正式结果通过 `scripts/export_trace_average.sh albatross llama_cpp` 生成平均耗时。
+- `web_rwkv` 正式结果在 Windows 环境运行同一平均导出契约；不要用 WSL 下的 llvmpipe
+  WebGPU fallback 结果覆盖 `test_gen/web_rwkv/fp16/case_000000`。
+  Windows 下如果 Dx12 adapter 不暴露 `SUBGROUP` feature，`web_rwkv` trace 使用
+  `cargo run --no-default-features --features tokio --example trace_infer -- --model ..\..\weights\rwkv7-g1f-1.5b-20260419-ctx8192.st`，
+  避免默认 `native` feature 请求不可用的 subgroup capability。
 
 ## rwkv-test CLI
 
@@ -488,84 +575,172 @@ worst_cosine=...
 
 ## 推理引擎 Benchmark
 
-运行不同的推理引擎：
+Benchmark 必须先冻结测量合同，再开始长跑。不要把 synthetic throughput、server
+latency、GSM8K workload、trace/export timing 混进同一个速度结论。每次跑分都必须能回答：
+测的是什么、使用哪个 runner、输入样本如何生成、是否固定 RTX 5090、失败组合为什么失败。
 
-- 记录它们各自的吞吐量 Prefill TokenPerSecond 和 Decode TokenPerSecond。
-- 记录延迟指标：TTFT、E2EL、TokenGenerationTime（E2EL-TTFT）、TimePerOutputToken（TokenGenerationTime / (token 数 - 1)）、ITL、分位数延迟。
-- 绘制图像来对比不同的推理后端（需要选择合适的绘图形式来清晰对比）。
+### 硬件与 Preflight
 
-优先直接使用成熟推理引擎已有 benchmark/server/API 路径测量，不新增推理入口、不改核心调度。只为 albatross、rwkv-lightning 这类 demo 型代码，或 web-rwkv / rwkv-mobile 这种只有库/example bench、缺少完整服务压测指标的后端，添加薄测量脚本。
+所有性能数据只允许使用本机 RTX 5090。运行前必须写入 preflight 记录：
 
-### 固定测试矩阵
+- `gpu_name`、`gpu_uuid`、driver version、CUDA / backend runtime version。
+- benchmark 二进制路径、commit / build id、完整命令行。
+- 模型文件路径、量化类型、文件大小，建议记录 sha256。
+- 结果 CSV 的 `device` 字段必须是可追踪的硬件标识，至少为 `cuda0`，聚合报告必须同时包含
+  RTX 5090 的 `gpu_uuid`。只写 `cuda`、`unknown` 或 CPU 结果不能参与最终对比。
+- WSL 下 `web-rwkv` 如果只能看到 `llvmpipe` 或 `unknown`，不得参与 5090 对比；必须改用能看到
+  RTX 5090 的 Windows native / Dx12 路径，或明确标记 `unsupported`。
+- 没权限或 GPU 不可见时停止测试，不允许改用 CPU 产出性能数据。
 
-- `bsz = [1, 16, 64, 128, 256, 512, 1024]`
+### 模型与量化矩阵
+
+Task 5 的 llama.cpp/RWKV 模型规模矩阵为：
+
+- `0.1B`: `rwkv7-g1d-0.1b-20260129-ctx8192`
+- `0.4B`: `rwkv7-g1d-0.4b-20260210-ctx8192`
+- `2.9B`: `rwkv7-g1f-2.9b-20260420-ctx8192`
+- `7.2B`: `rwkv7-g1f-7.2b-20260414-ctx8192`
+- `13.3B`: `rwkv7-g1f-13.3b-20260415-ctx8192`
+
+每个规模至少导出并测试：
+
+- `FP16`
+- `Q4_K_M`
+- `Q5_K_M`
+- `Q6_K`
+- `Q8_0`
+
+`1.5B` 可作为额外参考点，但不能替代上述五个规模，也不能让图表只围绕 `1.5B` 展开。
+
+### Benchmark 类型
+
+#### 1. Synthetic Throughput
+
+目标：测后端核心 prefill/decode 计算吞吐，尽量暴露 RTX 5090 能力。它不是 GSM8K 测试。
+
+矩阵：
+
+- `bsz = [1, 16, 64, 128, 256, 320, 512, 960, 1024]`
 - `prompt_len = [16, 256, 512, 1024, 4096]`
 - `decode_len = 16`
-- 数据使用：`data/gsm8k.jsonl`
-- 允许 warmup。
-- 每个仓库输出统一 CSV，并添加绘图脚本。
-- 不要跑任何 smoke，直接跑出最终结果。
 
-### Measurement Approach
+实现要求：
 
-全部使用本机 GPU 5090 运行。没权限找用户提权。
+- llama.cpp 使用 `llama-batched-bench`，固定 `CUDA_VISIBLE_DEVICES=0` 和 `-ngl 999`。
+- nano-vllM / albatross / web-rwkv / rwkv-mobile 必须使用各自最接近“核心模型计算”的 batch
+  prefill + decode 路径，不要通过 HTTP server 路径冒充核心吞吐。
+- 不支持的组合写 `status=unsupported`，真实运行失败写 `status=failed` 并保存错误。
 
-- nano-vllm：
-  - 优先使用现有 OpenAI-compatible server + `benchmark_openai_api_perf.py` / `benchmark_openai_api.py`。
-  - 用 `users_sweep` 映射 `bsz`，`max_tokens=16`，开启 streaming 以获得 TTFT / E2EL / ITL。
-  - 如需严格 token 长度，用现有 `benchmark_rwkv.py` 的 direct engine 路径补充 exact `prompt_len` 的 prefill/decode TPS，不新增服务入口。
-- llama.cpp：
-  - 吞吐量优先使用原生 `llama-batched-bench`：`pl=bsz`、`pp=prompt_len`、`tg=16`、JSONL 输出。
-  - 延迟指标优先使用现有 `llama-server` + `scripts/server-bench.py` 或 OpenAI-compatible streaming 请求测 TTFT / E2EL / ITL。
-  - 只添加结果转换脚本，把原生 JSONL / server-bench 输出规整成统一 CSV。
-- albatross / rwkv-lightning：
-  - 作为 demo 型后端，直接打印时间来完成测量。
-  - 直接调用真实 tokenizer/model forward 路径；prefill 用 batch prompt，decode 循环 16 token。
-  - 只测原始代码可提供的路径；不实现完整队列调度。
-- web-rwkv：
-  - 基于现有 `examples/bench.rs` 扩展为 CSV benchmark example。
-  - 不实现 server/scheduler，只测 library runtime 的 prefill/decode 原始路径。
-- rwkv-mobile：
-  - 基于已有 `simple_benchmark.cpp` / `batch_benchmark.cpp` 增加 CSV 输出版本。
-  - 优先用已有 runtime API 和 batch decode；不补完整请求队列。
-  - 不支持的 `bsz` / `prompt_len` 组合写 `status=failed` 或 `status=unsupported`。
+导出：
 
-## CSV Schema
+- `results/task5_throughput.csv`
+- 原始 runner 输出保存到 `results/raw/throughput/`
 
-统一字段：
+#### 2. Synthetic Server Latency
 
-- `repo,backend,model_path,model_format,device,dtype,quantization`
+目标：测服务/调度路径的 TTFT、E2EL、ITL。它可以 GPU 利用率较低，不能拿来表示峰值吞吐。
+
+矩阵同 synthetic throughput，但必须真实执行 `repeat`，不能只把 `repeat` 写进 CSV。
+
+实现要求：
+
+- 每个 `(model, quant, bsz, prompt_len, decode_len)` 至少运行 `repeat >= 3`。
+- prompt token 可以由固定 fixture 生成，也可以由 GSM8K 文本 token 化后重复/截断，但必须在 CSV
+  或 manifest 里标明 `prompt_source`。
+- 每个请求要保存请求级原始数据，聚合指标由请求级数据计算。
+
+导出：
+
+- `results/task5_latency_synthetic.csv`
+- `results/raw/latency_synthetic/*.jsonl`
+
+#### 3. GSM8K Workload Latency
+
+目标：测真实 GSM8K prompt 分布下的服务延迟。它不是固定 `prompt_len` 矩阵。
+
+要求：
+
+- 默认使用 `data/gsm8k.jsonl` 全量 1319 条问题。
+- 不强行把 prompt 重复/截断到固定长度；记录自然 token 长度。
+- 并发档位建议从 `[1, 16, 64, 128]` 开始；更高并发只有在后端明确支持时再加。
+- `decode_len` 应按真实服务目标单独固定，例如 `16` 用于短 decode，`128` 用于更稳定的生成延迟。
+
+导出：
+
+- `results/task5_latency_gsm8k_requests.csv`：一请求一行。
+- `results/task5_latency_gsm8k_summary.csv`：按模型/量化/并发聚合。
+- `results/raw/latency_gsm8k/*.jsonl`
+
+### CSV Schema
+
+所有 CSV 至少包含：
+
+- `run_id,repo,backend,runner,benchmark_kind`
+- `model_size,model_path,model_format,device,gpu_name,gpu_uuid,dtype,quantization`
 - `bsz,prompt_len,decode_len,warmup,repeat,seed,status,error`
-- `prefill_tokens,output_tokens`
+- `prompt_source,prompt_count,prompt_tokens,output_tokens`
 - `prefill_time_s,ttft_s,e2el_s,token_generation_time_s`
 - `prefill_tps,decode_tps,e2e_tps,time_per_output_token_ms`
 - `itl_mean_ms,itl_p50_ms,itl_p90_ms,itl_p95_ms,itl_p99_ms`
+- `command,binary_path,binary_build_id,started_at,ended_at`
 
 指标定义：
 
 - TTFT：请求开始到首个输出 token 到达。
-- E2EL：请求开始到 16 个输出 token 完成。
+- E2EL：请求开始到请求完成。
 - TokenGenerationTime = E2EL - TTFT。
-- TimePerOutputToken = TokenGenerationTime / (decode_len - 1)。
+- TimePerOutputToken = TokenGenerationTime / max(`decode_len - 1`, 1)。
 - ITL：首 token 后相邻 token 到达间隔。
-- Prefill TokenPerSecond = bsz \* prompt_len / prefill_time_s。
-- Decode TokenPerSecond = bsz \* (decode_len - 1) / TokenGenerationTime。
+- Prefill TokenPerSecond = `prefill_tokens / prefill_time_s`。
+- Decode TokenPerSecond = `output_tokens / TokenGenerationTime`，或 runner 原生 decode TPS；必须在
+  `runner` / `benchmark_kind` 中区分。
 
-## Plotting
+### GPU Telemetry
 
-每个仓库添加 `plot_task5.py`，读取本仓库 CSV 并输出：
+每次性能测试必须旁路采集 GPU telemetry：
 
-- `results/task5_prefill_tps.png`
-- `results/task5_decode_tps.png`
-- `results/task5_ttft.png`
-- `results/task5_e2el.png`
-- `results/task5_itl_p95.png`
+- `results/gpu_telemetry.csv`
+- 字段：`timestamp,run_id,gpu_uuid,gpu_util,mem_used,mem_total,power_w,sm_clock,mem_clock,pstate,process_name`
 
-图形规则：
+没有 telemetry 的结果只能作为开发调试数据，不能作为最终性能报告。
 
-- x 轴为 `bsz`。
-- 按 `prompt_len` 分面或分图。
-- 不同后端/模式用不同颜色。
-- 吞吐图使用 log y 轴。
-- 延迟图使用 ms 单位。
-- 失败组合不绘图，但保留在 CSV。
+### Plotting
+
+不同 benchmark kind 分开画，不能混图。
+
+Synthetic throughput：
+
+- `plots/throughput_prefill_heatmap.png`：`bsz x prompt_len` 的 `prefill_tps`。
+- `plots/throughput_decode_heatmap.png`：`bsz x prompt_len` 的 `decode_tps`。
+- `plots/throughput_frontier.png`：每个模型/量化能成功运行的最大 `bsz * (prompt_len + decode_len)`。
+- `plots/throughput_pareto.png`：模型大小 / 量化大小 vs `decode_tps`。
+
+Synthetic server latency：
+
+- `plots/latency_synthetic_ttft_p95.png`
+- `plots/latency_synthetic_e2el_p95.png`
+- `plots/latency_synthetic_itl_p95.png`
+
+GSM8K workload latency：
+
+- `plots/gsm8k_ttft_cdf.png`
+- `plots/gsm8k_e2el_cdf.png`
+- `plots/gsm8k_concurrency_reqps.png`
+- `plots/gsm8k_concurrency_p95_latency.png`
+
+GPU telemetry：
+
+- `plots/gpu_util_time.png`
+- `plots/gpu_vram_time.png`
+- `plots/gpu_power_time.png`
+
+### 无效结果处理
+
+以下结果必须删除或移入明确的 rejected 目录，不得参与最终报告：
+
+- CPU 性能数据。
+- 只写 `cuda` / `unknown` 且没有 RTX 5090 `gpu_uuid` 的性能数据。
+- smoke test 数据。
+- partial run 数据，除非文件名和 manifest 明确标记 `partial`。
+- trace/export 模式数据。
+- 把 `llama-batched-bench` throughput 和 `llama-server` latency 混成一个速度结论的数据。

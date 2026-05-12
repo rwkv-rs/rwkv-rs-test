@@ -7,7 +7,7 @@ from rwkvt.infctx_module import *
 
 from rwkvt.operator.rwkvop import RUN_CUDA_RWKV7g, RUN_RWKV7_STATE, RUN_RWKV7_INFCTX
 from torch.nn import functional as F
-from rwkvt.trace import trace_cell
+from rwkvt.trace import timer_elapsed, timer_start, trace_cell
 
 if os.environ["FUSED_KERNEL"] == '1':
     from rwkvfla.ops.rwkv7 import fused_addcmul_rwkv7
@@ -151,6 +151,7 @@ class RWKV_Tmix_x070(nn.Module):
 
         if attention_mask is not None:
             x = x.mul(attention_mask[:, -x.shape[-2]:, None])
+        time_mixer_start = timer_start(x, v_first)
         xx = self.time_shift(x) - x
 
         xr, xw, xk, xv, xa, xg = self.addcmul_kernel(x, xx)
@@ -161,12 +162,19 @@ class RWKV_Tmix_x070(nn.Module):
         else:
             w = -F.softplus(-(self.w0 + torch.tanh(xw @ self.w1) @ self.w2)) - 0.5 # soft-clamp to (-inf, -0.5)
         k = self.key(xk)
+        value_start = timer_start(xv)
+        value_trace = v_first
         v = self.value(xv)
         if self.layer_id == 0:
             v_first = v # store the v of the first layer
+            value_trace = v_first
+            value_elapsed_ns = timer_elapsed(value_start, v_first)
         else:
             v = v + (v_first - v) * torch.sigmoid(self.v0 + (xv @ self.v1) @ self.v2) # add value residual
-        trace_cell(self.layer_id, "time_mixer/value_from_first_cell.safetensors", v_first)
+            value_start = timer_start(v_first)
+            value_trace = v_first.contiguous().clone()
+            value_elapsed_ns = timer_elapsed(value_start, value_trace)
+        trace_cell(self.layer_id, "time_mixer/value_from_first_cell.safetensors", value_trace, value_elapsed_ns)
         a = torch.sigmoid(self.a0 + (xa @ self.a1) @ self.a2) # a is "in-context learning rate"
         g = torch.sigmoid(xg @ self.g1) @ self.g2
 
@@ -182,7 +190,8 @@ class RWKV_Tmix_x070(nn.Module):
 
         x = x + ((r.view(B,T,H,-1)*k.view(B,T,H,-1)*self.r_k).sum(dim=-1, keepdim=True) * v.view(B,T,H,-1)).view(B,T,C)
         x = self.output(x * g)
-        trace_cell(self.layer_id, "time_mixer/embedded_context.safetensors", x)
+        time_mixer_elapsed_ns = timer_elapsed(time_mixer_start, x)
+        trace_cell(self.layer_id, "time_mixer/embedded_context.safetensors", x, time_mixer_elapsed_ns)
         return x, v_first
   
 

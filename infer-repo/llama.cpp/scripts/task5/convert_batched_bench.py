@@ -14,10 +14,20 @@ def convert_rows(
     *,
     model_path: Path,
     backend: str,
+    runner: str = "llama-batched-bench",
+    benchmark_kind: str = "synthetic_throughput",
     device: str,
+    gpu_name: str = "",
+    gpu_uuid: str = "",
     warmup: int,
     repeat: int,
     seed: int,
+    run_id: str | None = None,
+    command: str | list[str] = "",
+    binary_path: Path | str = "",
+    binary_build_id: str = "",
+    started_at: str = "",
+    ended_at: str = "",
 ) -> list[dict[str, Any]]:
     rows = []
     for item in read_jsonl(input_path):
@@ -32,7 +42,11 @@ def convert_rows(
         row = base_row(
             model_path=model_path,
             backend=backend,
+            runner=runner,
+            benchmark_kind=benchmark_kind,
             device=device,
+            gpu_name=gpu_name,
+            gpu_uuid=gpu_uuid,
             bsz=bsz,
             prompt_len=prompt_len,
             decode_len=decode_len,
@@ -40,9 +54,18 @@ def convert_rows(
             repeat=repeat,
             seed=seed,
             status="ok",
+            run_id=run_id,
+            command=command,
+            binary_path=binary_path,
+            binary_build_id=binary_build_id,
+            started_at=started_at,
+            ended_at=ended_at,
+            prompt_source="synthetic_runner_tokens",
+            prompt_count=bsz,
         )
         row.update(
             {
+                "prompt_tokens": prefill_tokens,
                 "prefill_tokens": prefill_tokens,
                 "output_tokens": output_tokens,
                 "prefill_time_s": prefill_time_s,

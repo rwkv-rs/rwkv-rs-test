@@ -709,6 +709,10 @@ def parse_args() -> argparse.Namespace:
         help="use more RAM by computing all outputs before writing (use in case lazy evaluation is broken)",
     )
     parser.add_argument(
+        "--mmap-load", action="store_true",
+        help="load the input checkpoint with torch.load(..., mmap=True) to reduce peak RAM",
+    )
+    parser.add_argument(
         "--model-name", type=str, default=None,
         help="name of the model",
     )
@@ -793,7 +797,7 @@ def main() -> None:
 
     logger.info(f"Loading model: {model_path.name}")
 
-    state_dict = torch.load(model_path, map_location="cpu")
+    state_dict = torch.load(model_path, map_location="cpu", mmap=args.mmap_load)
     version, n_layer, n_head, n_embd, n_vocab = check_rwkv_info(state_dict)
     print(f"version: {version}, n_layer: {n_layer}, n_head: {n_head}, n_embd: {n_embd}, n_vocab: {n_vocab}")
 

@@ -22,6 +22,9 @@ struct trace_context {
     std::filesystem::path case_root;
     std::map<std::string, std::string> node_to_file;
     std::set<std::string> exported;
+    std::string pending_node;
+    std::chrono::steady_clock::time_point pending_start;
+    bool pending_timing = false;
 };
 
 static void print_usage(const char * argv0) {
@@ -98,22 +101,25 @@ static void trace_bytes(
         const std::string & filename,
         const std::string & dtype,
         const std::vector<size_t> & shape,
-        const std::vector<uint8_t> & bytes) {
+        const std::vector<uint8_t> & bytes,
+        long long elapsed_ns) {
     const auto path = case_root / filename;
-    const auto start = std::chrono::steady_clock::now();
     save_safetensor(path, tensor_name(filename), dtype, shape, bytes);
-    const auto end = std::chrono::steady_clock::now();
-    write_trace_time(path, filename, std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+    write_trace_time(path, filename, elapsed_ns);
 }
 
 static void trace_tokens(const std::filesystem::path & case_root, const std::vector<llama_token> & tokens) {
     std::vector<int64_t> tokens_i64(tokens.begin(), tokens.end());
     std::vector<uint8_t> bytes(tokens_i64.size() * sizeof(int64_t));
     memcpy(bytes.data(), tokens_i64.data(), bytes.size());
-    trace_bytes(case_root, "embedding/token_ids.safetensors", "I64", {tokens.size()}, bytes);
+    trace_bytes(case_root, "embedding/token_ids.safetensors", "I64", {tokens.size()}, bytes, 0);
 }
 
-static void trace_ggml(const std::filesystem::path & case_root, const std::string & filename, const ggml_tensor * tensor) {
+static void trace_ggml(
+        const std::filesystem::path & case_root,
+        const std::string & filename,
+        const ggml_tensor * tensor,
+        long long elapsed_ns) {
     const bool trace_last_token_only =
         filename == "lm_head/embedded_context.safetensors" ||
         filename == "lm_head/logits.safetensors";
@@ -140,29 +146,47 @@ static void trace_ggml(const std::filesystem::path & case_root, const std::strin
         }
         std::vector<uint8_t> f16_bytes(f16.size() * sizeof(ggml_fp16_t));
         memcpy(f16_bytes.data(), f16.data(), f16_bytes.size());
-        trace_bytes(case_root, filename, "F16", shape, f16_bytes);
+        trace_bytes(case_root, filename, "F16", shape, f16_bytes, elapsed_ns);
         return;
     }
     if (trace_last_token_only && tensor->ne[1] > 1) {
         const size_t row_size = static_cast<size_t>(tensor->ne[0]) * ggml_element_size(tensor);
         const size_t offset = static_cast<size_t>(tensor->ne[1] - 1) * row_size;
         std::vector<uint8_t> last(bytes.begin() + offset, bytes.begin() + offset + row_size);
-        trace_bytes(case_root, filename, ggml_dtype_name(tensor->type), shape, last);
+        trace_bytes(case_root, filename, ggml_dtype_name(tensor->type), shape, last, elapsed_ns);
         return;
     }
-    trace_bytes(case_root, filename, ggml_dtype_name(tensor->type), shape, bytes);
+    trace_bytes(case_root, filename, ggml_dtype_name(tensor->type), shape, bytes, elapsed_ns);
 }
 
 static bool trace_cb_eval(ggml_tensor * t, bool ask, void * user_data) {
     auto * trace = static_cast<trace_context *>(user_data);
     const auto it = trace->node_to_file.find(t->name);
     if (ask) {
-        return it != trace->node_to_file.end() && !trace->exported.count(t->name);
+        const bool needed = it != trace->node_to_file.end() && !trace->exported.count(t->name);
+        if (needed) {
+            trace->pending_node = t->name;
+            trace->pending_start = std::chrono::steady_clock::now();
+            trace->pending_timing = true;
+        }
+        return needed;
     }
     if (it == trace->node_to_file.end() || trace->exported.count(t->name)) {
         return true;
     }
-    trace_ggml(trace->case_root, it->second, t);
+
+    if (!trace->pending_timing || trace->pending_node != t->name) {
+        fprintf(stderr, "missing scheduler timing for trace node %s\n", t->name);
+        trace->pending_node.clear();
+        trace->pending_timing = false;
+        return false;
+    }
+    const auto end = std::chrono::steady_clock::now();
+    const auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - trace->pending_start).count();
+    trace->pending_node.clear();
+    trace->pending_timing = false;
+
+    trace_ggml(trace->case_root, it->second, t, elapsed_ns);
     trace->exported.insert(t->name);
     return true;
 }

@@ -3,7 +3,7 @@ import torch.nn as nn
 from .ffn import RWKV_Cmix_v7
 from .att import RWKV_Tmix_v7
 from rwkvt.infctx_module import BlockState
-from rwkvt.trace import trace, trace_cell
+from rwkvt.trace import measure, trace, trace_cell
 class Block(nn.Module):
     def __init__(self, args, layer_id):
         super().__init__()
@@ -41,21 +41,21 @@ class Block(nn.Module):
 
     def forward_normal(self, x, v_first, attention_mask = None):
         if self.layer_id == 0:
-            x = self.ln0(x)
-            trace("layer_norm0/embedded_context.safetensors", x)
+            x, elapsed_ns = measure(lambda: self.ln0(x), x)
+            trace("layer_norm0/embedded_context.safetensors", x, elapsed_ns)
 
-        x_tmix = self.ln1(x)
-        trace_cell(self.layer_id, "pre_layer_norm_for_time_mix/embedded_context.safetensors", x_tmix)
+        x_tmix, elapsed_ns = measure(lambda: self.ln1(x), x)
+        trace_cell(self.layer_id, "pre_layer_norm_for_time_mix/embedded_context.safetensors", x_tmix, elapsed_ns)
         x_attn, v_first = self.att(x_tmix, v_first, attention_mask = attention_mask)
-        x = x + x_attn
-        trace_cell(self.layer_id, "embedded_context_after_time_mixer.safetensors", x)
+        x, elapsed_ns = measure(lambda: x + x_attn, x, x_attn)
+        trace_cell(self.layer_id, "embedded_context_after_time_mixer.safetensors", x, elapsed_ns)
 
-        x_cmix = self.ln2(x)
-        trace_cell(self.layer_id, "pre_layer_norm_for_channel_mix/embedded_context.safetensors", x_cmix)
-        x_ffn = self.ffn(x_cmix, attention_mask = attention_mask)
-        trace_cell(self.layer_id, "channel_mixer/embedded_context.safetensors", x_ffn)
-        x = x + x_ffn
-        trace_cell(self.layer_id, "embedded_context_after_channel_mixer.safetensors", x)
+        x_cmix, elapsed_ns = measure(lambda: self.ln2(x), x)
+        trace_cell(self.layer_id, "pre_layer_norm_for_channel_mix/embedded_context.safetensors", x_cmix, elapsed_ns)
+        x_ffn, elapsed_ns = measure(lambda: self.ffn(x_cmix, attention_mask = attention_mask), x_cmix)
+        trace_cell(self.layer_id, "channel_mixer/embedded_context.safetensors", x_ffn, elapsed_ns)
+        x, elapsed_ns = measure(lambda: x + x_ffn, x, x_ffn)
+        trace_cell(self.layer_id, "embedded_context_after_channel_mixer.safetensors", x, elapsed_ns)
         return x, v_first
 
     def forward_infctx(self, x, v_first, last_state: BlockState, attention_mask = None):

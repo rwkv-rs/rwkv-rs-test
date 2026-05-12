@@ -33,6 +33,11 @@ def main() -> None:
     print(f"albatross trace prefill tokens={len(tokens)}")
 
     model = RWKV_x070(args)
+
+    warmup_state = model.generate_zero_state(0)
+    _ = model.forward_seq(torch.tensor(tokens), warmup_state)
+    torch.cuda.synchronize()
+
     state = model.generate_zero_state(0)
     logits = model.forward(tokens, state)
     torch.cuda.synchronize()

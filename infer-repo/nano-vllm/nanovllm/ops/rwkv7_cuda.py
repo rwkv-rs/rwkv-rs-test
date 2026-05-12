@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -8,6 +9,13 @@ from torch.utils.cpp_extension import load
 _LOADED = False
 _HEAD_SIZE = None
 _EXT_NAME = "nanovllm_rwkv7_state_fwd_fp16"
+
+
+def ensure_python_bin_on_path():
+    python_bin = os.path.dirname(sys.executable)
+    path_parts = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
+    if python_bin and python_bin not in path_parts:
+        os.environ["PATH"] = os.pathsep.join([python_bin, *path_parts])
 
 
 def ensure_loaded(head_size: int):
@@ -23,6 +31,7 @@ def ensure_loaded(head_size: int):
     cur = Path(__file__).resolve().parent
     src_cpp = str(cur / "cuda" / "rwkv7_state_fwd_fp16.cpp")
     src_cu = str(cur / "cuda" / "rwkv7_state_fwd_fp16.cu")
+    ensure_python_bin_on_path()
     load(
         name=_EXT_NAME,
         sources=[src_cpp, src_cu],

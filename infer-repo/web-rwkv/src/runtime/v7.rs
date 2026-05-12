@@ -1,4 +1,4 @@
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Instant};
 
 #[cfg(not(target_arch = "wasm32"))]
 use futures::future::BoxFuture;
@@ -8,8 +8,6 @@ use half::f16;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use web_rwkv_derive::DeserializeSeed;
-use wgpu::CommandBuffer;
-
 use super::{
     infer::{RnnChunk, RnnInfo, RnnInput, RnnOutput, RnnOutputBatch, RnnRedirect, Token},
     loader::{Loader, LoaderError, Reader},
@@ -24,7 +22,7 @@ use crate::{
         cache::ResourceCache,
         kind::ReadWrite,
         matrix::Matrix,
-        ops::{Activation, TensorCommand, TensorOp},
+        ops::{Activation, TensorCommand, TensorOp, TracedCommandBuffer},
         serialization::Seed,
         shape::{Shape, TensorDimension},
         DeepClone, IntoPackedCursors, TensorCpu, TensorError, TensorGpu, TensorGpuView, TensorInit,
@@ -421,7 +419,7 @@ pub enum Hook {
 }
 
 pub struct RnnJob {
-    commands: Vec<CommandBuffer>,
+    commands: Vec<TracedCommandBuffer>,
     redirect: RnnRedirect,
 
     embed: TensorCpu<f16>,
@@ -429,6 +427,29 @@ pub struct RnnJob {
     cursors: TensorGpu<u32, ReadWrite>,
     input: TensorGpu<f16, ReadWrite>,
     output: TensorGpu<f32, ReadWrite>,
+}
+
+impl RnnJob {
+    pub fn submit_timed(&mut self) -> HashMap<String, u128> {
+        let commands = std::mem::take(&mut self.commands);
+        let mut timings = HashMap::new();
+
+        for segment in commands {
+            let start = Instant::now();
+            let submission_index = Some(self.output.context.queue.submit(Some(segment.command)));
+            _ = self.output.context.device.poll(wgpu::PollType::Wait {
+                submission_index,
+                timeout: None,
+            });
+            let elapsed_ns = start.elapsed().as_nanos();
+
+            if let Some(label) = segment.label {
+                timings.insert(label, elapsed_ns);
+            }
+        }
+
+        timings
+    }
 }
 
 impl Job for RnnJob {
@@ -475,7 +496,10 @@ impl Job for RnnJob {
 
     fn submit(&mut self) {
         let commands = std::mem::take(&mut self.commands);
-        self.output.context.queue.submit(commands);
+        self.output
+            .context
+            .queue
+            .submit(commands.into_iter().map(|segment| segment.command));
     }
 
     async fn back(self) -> Result<Self::Output, RuntimeError> {
@@ -698,7 +722,7 @@ impl<F: Float> Dispatcher<RnnJob> for Bundle<F> {
         let commands = {
             #[cfg(feature = "trace")]
             let _span = tracing::trace_span!("encode").entered();
-            context.encode(&TensorOp::List(ops))
+            context.encode_traced(&TensorOp::List(ops))
         };
 
         Ok(RnnJob {

@@ -6,7 +6,7 @@
 
 import numpy as np
 np.set_printoptions(precision=4, suppress=True, linewidth=200)
-import types, torch, copy, time, random, json, math, gc
+import argparse, types, torch, copy, time, random, json, math, gc
 from tqdm import tqdm
 from torch.nn import functional as F
 SEED = 42
@@ -22,10 +22,14 @@ SHOW_SPEED_PERCENTILE = 50
 args = types.SimpleNamespace()
 args.vocab_size = 65536
 args.head_size = 64
+cli = argparse.ArgumentParser()
+cli.add_argument("--model", default="/models/rwkv7-g0a-7.2b-20250829-ctx4096", help="Model path without the .pth suffix")
+cli.add_argument("--decode-tokens", type=int, default=256)
+cli_args = cli.parse_args()
 #
 # model download: https://huggingface.co/BlinkDL/rwkv7-g1
 #
-args.MODEL_NAME = "/models/rwkv7-g0a-7.2b-20250829-ctx4096"
+args.MODEL_NAME = cli_args.model.removesuffix(".pth")
 # args.MODEL_NAME = "/models/rwkv7-g1a3-1.5b-20251015-ctx8192"
 # args.MODEL_NAME = "/models/rwkv7-g0a4-13.3b-20251114-ctx8192"
 # args.MODEL_NAME = "/models/rwkv7-g1a3-2.9b-20251103-ctx8192"
@@ -128,7 +132,7 @@ from torch.profiler import profile, ProfilerActivity, record_function
 xprint("Decode")
 
 prompt = "User: simulate SpaceX mars landing using python\n\nAssistant: <think"
-LENGTH_PER_TRIAL = 256
+LENGTH_PER_TRIAL = cli_args.decode_tokens
 TEMPERATURE = 1.0
 TOP_P = 0.0
 print(prompt, end="")
@@ -204,7 +208,7 @@ print(f'\n\nToken/s = {round(1/times,2)} (forward), {round(1/all_times,2)} (full
 xprint("Decode (CUDAGraph)")
 
 prompt = "User: simulate SpaceX mars landing using python\n\nAssistant: <think"
-LENGTH_PER_TRIAL = 256
+LENGTH_PER_TRIAL = cli_args.decode_tokens
 TEMPERATURE = 1.0
 TOP_P = 0.0
 print(prompt, end="")

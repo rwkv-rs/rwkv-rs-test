@@ -50,9 +50,11 @@ if __name__ == "__main__":
     parser.add_argument("--ds_bucket_mb", default=200, type=int)  # deepspeed bucket size in MB. 200 seems enough
 
     parser.add_argument("--head_size", default=64, type=int) # can try larger values for larger models
+    parser.add_argument("--head_chunk", default=0, type=int) # 0 = fast, takes more VRAM; 65536 = saves 70% VRAM (when your bsz is large), slower; 4096 = saves 80% VRAM (when your bsz is large), slower
     parser.add_argument("--load_partial", default=0, type=int)
     parser.add_argument("--magic_prime", default=0, type=int)
     parser.add_argument("--my_testing", default='x070', type=str)
+    parser.add_argument("--kernel", default="", type=str)
     parser.add_argument("--my_exit_tokens", default=0, type=int)
 
     parser = Trainer.add_argparse_args(parser)
@@ -89,8 +91,10 @@ if __name__ == "__main__":
     args.betas = (args.beta1, args.beta2)
     args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
     os.environ["RWKV_MY_TESTING"] = args.my_testing
+    os.environ["RWKV_KERNEL"] = args.kernel
     os.environ["RWKV_CTXLEN"] = str(args.ctx_len)
     os.environ["RWKV_HEAD_SIZE"] = str(args.head_size)
+    os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"] = str(args.head_chunk)
     if args.dim_att <= 0:
         args.dim_att = args.n_embd
     if args.dim_ffn <= 0:
@@ -104,7 +108,9 @@ if __name__ == "__main__":
     args.epoch_steps = 40320 // args.real_bsz
     assert args.epoch_steps * args.real_bsz == 40320
 
-    if args.train_stage >= 2 and len(args.load_model) > 0:  # find latest saved model
+    trace_once = os.environ.get("RWKV_TRACE_ONCE") == "1"
+
+    if args.train_stage >= 2 and not trace_once:  # find latest saved model
         list_p = []
         for p in os.listdir(args.proj_dir):
             if p.startswith("rwkv") and p.endswith(".pth"):
@@ -173,7 +179,7 @@ if __name__ == "__main__":
         rank_zero_info("\n\nNote: you are using fp16 (might overflow). Try bf16 / tf32 for stable training.\n\n")
 
     os.environ["RWKV_JIT_ON"] = "1"
-    if os.environ.get("RWKV_TRACE_ONCE") == "1":
+    if trace_once:
         args.grad_cp = 0
         os.environ["RWKV_JIT_ON"] = "0"
     if "deepspeed_stage_3" in args.strategy:
@@ -206,7 +212,10 @@ if __name__ == "__main__":
     from src.model import RWKV
     model = RWKV(args)
 
-    if len(args.load_model) == 0 or args.train_stage == 1:  # shall we build the initial weights?
+    if trace_once and len(args.load_model) == 0:
+        raise RuntimeError("RWKV_TRACE_ONCE requires an explicit --load_model")
+
+    if not trace_once and (len(args.load_model) == 0 or args.train_stage == 1):  # shall we build the initial weights?
         init_weight_name = f"{args.proj_dir}/rwkv-init.pth"
         generate_init_weight(model, init_weight_name)  # save initial weights
         args.load_model = init_weight_name

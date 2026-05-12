@@ -77,6 +77,13 @@ impl<T: Scalar, K: Kind> TensorCommand<T, K> for CommandEncoder {
 
 impl crate::context::Context {
     pub fn encode(&self, op: &TensorOp) -> Vec<CommandBuffer> {
+        self.encode_traced(op)
+            .into_iter()
+            .map(|segment| segment.command)
+            .collect()
+    }
+
+    pub fn encode_traced(&self, op: &TensorOp) -> Vec<TracedCommandBuffer> {
         struct Atom<'a> {
             pipeline: &'a CachedPipeline,
             bindings: &'a [Arc<BindGroup>],
@@ -98,8 +105,22 @@ impl crate::context::Context {
             pass.dispatch_workgroups(dispatch[0], dispatch[1], dispatch[2]);
         }
 
+        fn flush<'b, 'a: 'b>(
+            commands: &'b mut Vec<(Option<String>, Vec<Atom<'a>>)>,
+            passes: &'b mut Vec<Atom<'a>>,
+            label: Option<String>,
+        ) {
+            if passes.is_empty() {
+                return;
+            }
+
+            let mut atoms = vec![];
+            std::mem::swap(&mut atoms, passes);
+            commands.push((label, atoms));
+        }
+
         fn flatten<'b, 'a: 'b>(
-            commands: &'b mut Vec<Vec<Atom<'a>>>,
+            commands: &'b mut Vec<(Option<String>, Vec<Atom<'a>>)>,
             passes: &'b mut Vec<Atom<'a>>,
             op: &'a TensorOp,
         ) {
@@ -114,33 +135,37 @@ impl crate::context::Context {
                     dispatch,
                 }),
                 TensorOp::List(ops) => ops.iter().for_each(|op| flatten(commands, passes, op)),
-                TensorOp::Sep => {
-                    let mut temp = vec![];
-                    std::mem::swap(&mut temp, passes);
-                    commands.push(temp);
-                }
+                TensorOp::Sep => flush(commands, passes, None),
+                TensorOp::Trace(label) => flush(commands, passes, Some(label.clone())),
             }
         }
 
         let mut commands = vec![];
         let mut passes = vec![];
         flatten(&mut commands, &mut passes, op);
-        commands.push(passes);
+        flush(&mut commands, &mut passes, None);
 
         commands
             .into_iter()
-            .filter(|atoms| !atoms.is_empty())
-            .map(|atoms| {
+            .map(|(label, atoms)| {
                 let mut encoder = self.device.create_command_encoder(&Default::default());
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 for atom in atoms {
                     dispatch(&mut pass, atom);
                 }
                 drop(pass);
-                encoder.finish()
+                TracedCommandBuffer {
+                    label,
+                    command: encoder.finish(),
+                }
             })
             .collect()
     }
+}
+
+pub struct TracedCommandBuffer {
+    pub label: Option<String>,
+    pub command: CommandBuffer,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -285,6 +310,7 @@ pub enum TensorOp {
     },
     List(Vec<TensorOp>),
     Sep,
+    Trace(String),
 }
 
 impl TensorOp {
@@ -294,6 +320,11 @@ impl TensorOp {
     #[inline]
     pub fn empty() -> Self {
         Self::List(vec![])
+    }
+
+    #[inline]
+    pub fn trace(label: impl Into<String>) -> Self {
+        Self::Trace(label.into())
     }
 
     /// Softmax operator applied on `x`.

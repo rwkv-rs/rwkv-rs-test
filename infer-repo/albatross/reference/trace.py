@@ -6,7 +6,6 @@ from pathlib import Path
 from time import perf_counter_ns
 
 import torch
-from safetensors.torch import save_file
 
 
 def trace_enabled() -> bool:
@@ -20,16 +19,40 @@ def case_root() -> Path:
     return Path(root) / "albatross" / "fp16" / "case_000000"
 
 
-def trace(output_path: str | Path, filename: str, tensor: torch.Tensor) -> None:
+def _sync_if_cuda(tensor: torch.Tensor) -> None:
+    if tensor.device.type == "cuda":
+        torch.cuda.synchronize(tensor.device)
+
+
+def measure(fn, *inputs):
+    if trace_enabled():
+        for tensor in inputs:
+            if isinstance(tensor, torch.Tensor):
+                _sync_if_cuda(tensor)
+        start = perf_counter_ns()
+        output = fn()
+        if isinstance(output, torch.Tensor):
+            _sync_if_cuda(output)
+        elif isinstance(output, tuple):
+            for tensor in output:
+                if isinstance(tensor, torch.Tensor):
+                    _sync_if_cuda(tensor)
+        elapsed_ns = perf_counter_ns() - start
+        return output, elapsed_ns
+
+    return fn(), 0
+
+
+def trace(output_path: str | Path, filename: str, tensor: torch.Tensor, elapsed_ns: int = 0) -> None:
+    from safetensors.torch import save_file
+
     path = Path(output_path) / filename
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    start = perf_counter_ns()
     view = tensor.detach()
     if not view.is_contiguous():
         raise RuntimeError("trace requires a contiguous torch.Tensor")
     save_file({path.stem: view}, path)
-    elapsed_ns = perf_counter_ns() - start
 
     path.with_suffix(".time.json").write_text(
         json.dumps({"filename": filename, "elapsed_ns": elapsed_ns}),
@@ -37,8 +60,8 @@ def trace(output_path: str | Path, filename: str, tensor: torch.Tensor) -> None:
     )
 
 
-def trace_tensor(filename: str, tensor: torch.Tensor) -> None:
-    trace(case_root(), filename, tensor.contiguous())
+def trace_tensor(filename: str, tensor: torch.Tensor, elapsed_ns: int = 0) -> None:
+    trace(case_root(), filename, tensor.contiguous(), elapsed_ns)
 
 
 def trace_token_ids(tokens: torch.Tensor) -> None:

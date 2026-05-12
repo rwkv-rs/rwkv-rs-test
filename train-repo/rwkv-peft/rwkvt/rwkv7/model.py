@@ -9,7 +9,7 @@ from torch.nn import functional as F
 import deepspeed
 from rwkvt.infctx_module import BlockStateList
 from .block import Block
-from rwkvt.trace import trace
+from rwkvt.trace import measure, trace
 
 class RWKV7(nn.Module):
     def __init__(self, args):
@@ -60,9 +60,9 @@ class RWKV7(nn.Module):
         B, T = input_ids.size()
         assert T <= args.ctx_len, "Cannot forward, model ctx_len is exhausted."
 
-        x = self.emb(input_ids)
         trace("embedding/token_ids.safetensors", input_ids)
-        trace("embedding/embedded_context.safetensors", x)
+        x, elapsed_ns = measure(lambda: self.emb(input_ids), input_ids)
+        trace("embedding/embedded_context.safetensors", x, elapsed_ns)
         v_first = torch.empty_like(x)
 
         for block in self.blocks:
@@ -74,10 +74,10 @@ class RWKV7(nn.Module):
             else:
                 x, v_first = block(x, v_first, attention_mask)
 
-        x = self.ln_out(x)
-        trace("lm_head/embedded_context.safetensors", x)
-        x = self.head(x)
-        trace("lm_head/logits.safetensors", x)
+        x, elapsed_ns = measure(lambda: self.ln_out(x), x)
+        trace("lm_head/embedded_context.safetensors", x, elapsed_ns)
+        x, elapsed_ns = measure(lambda: self.head(x), x)
+        trace("lm_head/logits.safetensors", x, elapsed_ns)
 
         return x
 

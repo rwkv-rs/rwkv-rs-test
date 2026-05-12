@@ -17,10 +17,10 @@ use tokio::{
 use web_rwkv::{
     context::{Context, ContextBuilder},
     runtime::{
-        infer::{Rnn, RnnInput, RnnInputBatch, RnnOption},
+        infer::{RnnInput, RnnInputBatch, RnnOption},
         loader::Loader,
         model::{ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion},
-        v7, Runtime, TokioRuntime,
+        v7, Dispatcher, Job, JobInput,
     },
     tensor::{
         kind::ReadWrite,
@@ -114,33 +114,45 @@ fn write_bytes(
     dtype: SafeDtype,
     shape: Vec<usize>,
     bytes: &[u8],
+    elapsed_ns: u128,
 ) -> Result<()> {
     let path = root.join(filename);
     fs::create_dir_all(path.parent().unwrap())?;
 
-    let start = Instant::now();
     let view = TensorView::new(dtype, shape, bytes)?;
     serialize_to_file([(path.file_stem().unwrap().to_string_lossy(), view)], None, &path)?;
-    write_time(&path, filename, start.elapsed().as_nanos())
+    write_time(&path, filename, elapsed_ns)
 }
 
-fn write_cpu_f16(root: &Path, filename: &str, tensor: TensorCpu<f16>) -> Result<()> {
+fn write_cpu_f16(
+    root: &Path,
+    filename: &str,
+    tensor: TensorCpu<f16>,
+    elapsed_ns: u128,
+) -> Result<()> {
     write_bytes(
         root,
         filename,
         SafeDtype::F16,
         shape_vec(&tensor),
         bytemuck::cast_slice(tensor.data().as_ref()),
+        elapsed_ns,
     )
 }
 
-fn write_cpu_f32(root: &Path, filename: &str, tensor: TensorCpu<f32>) -> Result<()> {
+fn write_cpu_f32(
+    root: &Path,
+    filename: &str,
+    tensor: TensorCpu<f32>,
+    elapsed_ns: u128,
+) -> Result<()> {
     write_bytes(
         root,
         filename,
         SafeDtype::F32,
         shape_vec(&tensor),
         bytemuck::cast_slice(tensor.data().as_ref()),
+        elapsed_ns,
     )
 }
 
@@ -152,6 +164,7 @@ fn write_token_ids(root: &Path, tokens: &[u32]) -> Result<()> {
         SafeDtype::I64,
         vec![ids.len()],
         bytemuck::cast_slice(&ids),
+        0,
     )
 }
 
@@ -179,6 +192,30 @@ fn snapshot_f32(
     tensor
 }
 
+fn traced_blit_f16(
+    filename: &str,
+    input: &TensorGpu<f16, ReadWrite>,
+    output: &TensorGpu<f16, ReadWrite>,
+) -> std::result::Result<TensorOp, web_rwkv::tensor::TensorError> {
+    Ok(TensorOp::List(vec![
+        TensorOp::trace(filename),
+        TensorOp::blit(input, output)?,
+        TensorOp::Sep,
+    ]))
+}
+
+fn traced_blit_f32(
+    filename: &str,
+    input: &TensorGpu<f32, ReadWrite>,
+    output: &TensorGpu<f32, ReadWrite>,
+) -> std::result::Result<TensorOp, web_rwkv::tensor::TensorError> {
+    Ok(TensorOp::List(vec![
+        TensorOp::trace(filename),
+        TensorOp::blit(input, output)?,
+        TensorOp::Sep,
+    ]))
+}
+
 fn build_hooks(
     context: &Context,
     info: &ModelInfo,
@@ -189,127 +226,144 @@ fn build_hooks(
     let hidden_shape = [info.num_emb, num_token, 1, 1];
     let logits_shape = [info.num_vocab_padded(), 1, 1, 1];
 
+    let filename = "embedding/embedded_context.safetensors".to_owned();
     let target = snapshot_f16(
         context,
         &mut snapshots,
-        "embedding/embedded_context.safetensors",
+        filename.clone(),
         hidden_shape,
     );
     hooks.insert(
         v7::Hook::PostEmbedLoaded,
-        Box::new(move |frame| Ok(TensorOp::blit(&frame.buffer.input, &target)?)),
+        Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.input, &target)),
     );
 
+    let filename = "layer_norm0/embedded_context.safetensors".to_owned();
     let target = snapshot_f16(
         context,
         &mut snapshots,
-        "layer_norm0/embedded_context.safetensors",
+        filename.clone(),
         hidden_shape,
     );
     hooks.insert(
         v7::Hook::PostEmbedLayerNorm,
-        Box::new(move |frame| Ok(TensorOp::blit(&frame.buffer.x, &target)?)),
+        Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.x, &target)),
     );
 
     for layer in 0..info.num_layer {
+        let filename =
+            format!("cells/cell_{layer:04}/pre_layer_norm_for_time_mix/embedded_context.safetensors");
         let target = snapshot_f16(
             context,
             &mut snapshots,
-            format!("cells/cell_{layer:04}/pre_layer_norm_for_time_mix/embedded_context.safetensors"),
+            filename.clone(),
             hidden_shape,
         );
         hooks.insert(
             v7::Hook::PostAttLayerNorm(layer),
-            Box::new(move |frame| Ok(TensorOp::blit(&frame.buffer.att_x, &target)?)),
+            Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.att_x, &target)),
         );
 
+        let filename =
+            format!("cells/cell_{layer:04}/time_mixer/value_from_first_cell.safetensors");
         let target = snapshot_f16(
             context,
             &mut snapshots,
-            format!("cells/cell_{layer:04}/time_mixer/value_from_first_cell.safetensors"),
+            filename.clone(),
             hidden_shape,
         );
         hooks.insert(
             v7::Hook::PostAttValueResidual(layer),
-            Box::new(move |frame| Ok(TensorOp::blit(&frame.buffer.att_v0, &target)?)),
+            Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.att_v0, &target)),
         );
 
+        let filename = format!("cells/cell_{layer:04}/time_mixer/embedded_context.safetensors");
         let target = snapshot_f16(
             context,
             &mut snapshots,
-            format!("cells/cell_{layer:04}/time_mixer/embedded_context.safetensors"),
+            filename.clone(),
             hidden_shape,
         );
         hooks.insert(
             v7::Hook::PostAttOut(layer),
-            Box::new(move |frame| Ok(TensorOp::blit(&frame.buffer.att_o, &target)?)),
+            Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.att_o, &target)),
         );
 
+        let filename =
+            format!("cells/cell_{layer:04}/embedded_context_after_time_mixer.safetensors");
         let target = snapshot_f16(
             context,
             &mut snapshots,
-            format!("cells/cell_{layer:04}/embedded_context_after_time_mixer.safetensors"),
+            filename.clone(),
             hidden_shape,
         );
         hooks.insert(
             v7::Hook::PostAtt(layer),
-            Box::new(move |frame| Ok(TensorOp::blit(&frame.buffer.x, &target)?)),
+            Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.x, &target)),
         );
 
+        let filename = format!(
+            "cells/cell_{layer:04}/pre_layer_norm_for_channel_mix/embedded_context.safetensors"
+        );
         let target = snapshot_f16(
             context,
             &mut snapshots,
-            format!("cells/cell_{layer:04}/pre_layer_norm_for_channel_mix/embedded_context.safetensors"),
+            filename.clone(),
             hidden_shape,
         );
         hooks.insert(
             v7::Hook::PostFfnLayerNorm(layer),
-            Box::new(move |frame| Ok(TensorOp::blit(&frame.buffer.ffn_x, &target)?)),
+            Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.ffn_x, &target)),
         );
 
+        let filename = format!("cells/cell_{layer:04}/channel_mixer/embedded_context.safetensors");
         let target = snapshot_f16(
             context,
             &mut snapshots,
-            format!("cells/cell_{layer:04}/channel_mixer/embedded_context.safetensors"),
+            filename.clone(),
             hidden_shape,
         );
         hooks.insert(
             v7::Hook::PostFfnChannelMix(layer),
-            Box::new(move |frame| Ok(TensorOp::blit(&frame.buffer.ffn_x, &target)?)),
+            Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.ffn_x, &target)),
         );
 
+        let filename =
+            format!("cells/cell_{layer:04}/embedded_context_after_channel_mixer.safetensors");
         let target = snapshot_f16(
             context,
             &mut snapshots,
-            format!("cells/cell_{layer:04}/embedded_context_after_channel_mixer.safetensors"),
+            filename.clone(),
             hidden_shape,
         );
         hooks.insert(
             v7::Hook::PostFfn(layer),
-            Box::new(move |frame| Ok(TensorOp::blit(&frame.buffer.x, &target)?)),
+            Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.x, &target)),
         );
     }
 
+    let filename = "lm_head/embedded_context.safetensors".to_owned();
     let target = snapshot_f16(
         context,
         &mut snapshots,
-        "lm_head/embedded_context.safetensors",
+        filename.clone(),
         [info.num_emb, 1, 1, 1],
     );
     hooks.insert(
         v7::Hook::PostHeadLayerNorm,
-        Box::new(move |frame| Ok(TensorOp::blit(&frame.header.head_x, &target)?)),
+        Box::new(move |frame| traced_blit_f16(&filename, &frame.header.head_x, &target)),
     );
 
+    let filename = "lm_head/logits.safetensors".to_owned();
     let target = snapshot_f32(
         context,
         &mut snapshots,
-        "lm_head/logits.safetensors",
+        filename.clone(),
         logits_shape,
     );
     hooks.insert(
         v7::Hook::PostHead,
-        Box::new(move |frame| Ok(TensorOp::blit(&frame.header.head_o, &target)?)),
+        Box::new(move |frame| traced_blit_f32(&filename, &frame.header.head_o, &target)),
     );
 
     (hooks, snapshots)
@@ -345,15 +399,31 @@ async fn main() -> Result<()> {
     let model = builder.build_v7().await?;
     let (hooks, snapshots) = build_hooks(&context, &info, tokens.len());
     let bundle = v7::Bundle::<f16>::new_with_hooks(model, 1, hooks);
-    let runtime: Box<dyn Runtime<Rnn>> = Box::new(TokioRuntime::<Rnn>::new(bundle).await);
 
     let token_chunk_size = tokens.len();
     let prompt = RnnInputBatch::new(tokens.clone(), RnnOption::Last);
     let prompt = RnnInput::new(vec![prompt], token_chunk_size);
-    let (remaining, output) = runtime.infer(prompt).await?;
-    if remaining.num_token() != 0 {
+    let info = prompt
+        .iter()
+        .next()
+        .ok_or_else(|| anyhow!("trace input produced no inference job"))?;
+    let chunk = prompt.chunk();
+    if chunk.num_token() != tokens.len() {
         return Err(anyhow!("trace prefill did not consume the full prompt"));
     }
+    let mut job = bundle.dispatch(info)?;
+
+    let start = Instant::now();
+    job.load(&chunk)?;
+    let input_elapsed_ns = start.elapsed().as_nanos();
+
+    let mut timings = job.submit_timed();
+    timings.insert(
+        "embedding/embedded_context.safetensors".to_owned(),
+        input_elapsed_ns,
+    );
+
+    let output = job.back().await?;
     println!(
         "web-rwkv trace prefill complete logits_shape={:?}",
         output[0].shape()
@@ -362,8 +432,14 @@ async fn main() -> Result<()> {
     write_token_ids(&root, &tokens)?;
     for snapshot in snapshots {
         match snapshot {
-            TraceSnapshot::F16(filename, tensor) => write_cpu_f16(&root, &filename, tensor.back().await)?,
-            TraceSnapshot::F32(filename, tensor) => write_cpu_f32(&root, &filename, tensor.back().await)?,
+            TraceSnapshot::F16(filename, tensor) => {
+                let elapsed_ns = timings.get(&filename).copied().unwrap_or(0);
+                write_cpu_f16(&root, &filename, tensor.back().await, elapsed_ns)?
+            }
+            TraceSnapshot::F32(filename, tensor) => {
+                let elapsed_ns = timings.get(&filename).copied().unwrap_or(0);
+                write_cpu_f32(&root, &filename, tensor.back().await, elapsed_ns)?
+            }
         }
     }
 
