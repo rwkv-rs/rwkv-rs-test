@@ -2,323 +2,86 @@
 
 以下是提供的插桩函数设计，直接复制到 repo 中调用完成数据导出。
 
-`*.time.json` 的 `elapsed_ns` 只允许记录产生该 tensor 的被测 compute 区间耗时。不要在
-trace/export helper 内部计时；不要把 GPU readback、CPU copy、safetensors 序列化或文件
-写入算进去；也不要把整段 prefill / train step 的耗时挂到某个中间 tensor 上。
+激活值和耗时是两个独立契约：
 
-只要为某个被测输出写了插桩代码，就必须保证该输出的 `elapsed_ns` 来自正确的 compute
+- 激活值描述模块边界上的输入/输出 tensor，写入 canonical `.safetensors` 路径。
+- 耗时描述某个模块 forward 的 compute 区间，写入 `timing/<module>.time.json`。
+
+禁止给某个激活值路径写同名 `.time.json`，例如
+`embedding/token_ids.time.json`、`cells/cell_0000/time_mixer/embedded_context.time.json`
+都不是合法 timing 文件。输入激活没有模块 forward 耗时，不允许用 `elapsed_ns=0`
+伪造 timing；它只应该保存 `.safetensors`。
+
+`*.time.json` 的 `elapsed_ns` 只允许记录对应模块 forward 的被测 compute 区间耗时。计时
+边界必须包住被测模块调用本身，而不是插到 kernel 内部，也不要把 GPU readback、CPU copy、
+safetensors 序列化或文件写入算进去；更不要把整段 prefill / train step 的耗时挂到某个
+模块上。
+
+只要为某个模块写了 timing，就必须保证该模块的 `elapsed_ns` 来自正确的 compute
 边界和必要的设备同步。不会正确计时就不要写成 `0` 冒充有效 trace；该后端必须修正计时
-实现，或把对应测项标记为 unsupported 并拒绝产出 timing 结果。`elapsed_ns=0` 不是
-“测不了时的占位方案”，只能用于确实没有 compute 区间的输入元数据。
+实现，或把对应模块标记为 unsupported 并拒绝产出 timing 结果。
 
 `elapsed_ns` 必须写平均耗时，不允许写单次运行的总耗时。平均口径是同一原始程序入口、
 同一输入、同一模型、同一设备同步边界下，跳过 `warmup` 次完整 trace run 后，对 `repeat`
-次完整 trace run 中同名 `.time.json` 的有效 `elapsed_ns` 做算术平均：
+次完整 trace run 中同名模块 `.time.json` 的有效 `elapsed_ns` 做算术平均：
 
 ```text
 elapsed_ns = round(sum(samples_ns) / repeat)
 ```
 
 平均只跨完整 trace run，不在模型 forward 内重复执行某个子模块，也不按 token、batch
-element、hidden size 或输出元素数再除一次。每个 `.time.json` 必须同时写入：
+element、hidden size 或输出元素数再除一次。每个模块 `.time.json` 必须同时写入：
 
+- `module`：模块名，例如 `embedding`、`cells/cell_0000/time_mixer`。
 - `elapsed_ns`：平均后的 ns。
 - `repeat`：参与平均的有效 trace run 数。
 - `warmup`：未参与平均的预热 trace run 数。
 - `samples_ns`：参与平均的每次完整 trace run 原始样本。
 
-`elapsed_ns=0` 只允许用于确实没有被测 compute 区间的输入元数据，例如
-`embedding/token_ids.safetensors`。别名/透传 tensor、辅助输出和 unsupported 测项不得
-靠写 `0` 通过 timing 契约；需要保留数值 trace 时，应在测试/汇总层显式排除其 timing，
-或修正为可验证的真实计时。
+多输出模块只能写一个模块 timing。例如 `loss/l2wrap_cross_entropy` 同时导出 loss、lse、
+max_vals、argmax 等激活值时，只写 `timing/loss/l2wrap_cross_entropy.time.json`，
+不得把同一个耗时复制到多个激活值的同名 `.time.json`。
 
-### Rust
+### 模板文件
 
-```rust
-use std::{
-    fs::{create_dir_all, write},
-    path::Path,
-};
+代码模板已经拆到 `docs/trace_template`，主文档只保留行为约束和调用入口：
 
-use burn::prelude::{Backend, Tensor};
-use burn::tensor::{DType as BurnDType, TensorKind};
-use safetensors::{Dtype as SafeDtype, TensorView, serialize_to_file};
-use web_rwkv::{
-    num::Scalar,
-    tensor::{TensorGpu, TensorShape, kind::Kind},
-};
+- Rust Vulkan helper: `docs/trace_template/rust/vulkan/trace.rs`
+- Rust Vulkan usage: `docs/trace_template/rust/vulkan/usage.rs`
+- Rust Burn helper: `docs/trace_template/rust/burn/trace.rs`
+- Rust Burn usage: `docs/trace_template/rust/burn/usage.rs`
+- C++ helper: `docs/trace_template/cpp/trace.cpp`
+- C++ usage: `docs/trace_template/cpp/usage.cpp`
+- Python helper: `docs/trace_template/python/trace.py`
+- Python usage: `docs/trace_template/python/usage.py`
 
-fn tensor_name(filename: &str) -> String {
-    Path::new(filename)
-        .file_stem()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_owned()
-}
+Rust Vulkan helper 只描述 web-rwkv / WebGPU 插桩。web-rwkv 的 `TensorGpu` 有 runtime
+id，可以自动跳过重复输入/别名。Rust Burn helper 单独放在 `rust/burn` 下；Burn 的泛型
+`Tensor<B, D, K>` 不保证暴露稳定 storage id，因此只有传入 backend-specific key 时才启用
+自动去重，否则只做 canonical path 校验。调用点传入被测 closure 和 declarative output
+spec，例如 `outputs! { value => "..." }` 或 `outputs! { 0 => "...", 1 => "..." }`；
+`trace_*` 在内部执行 closure、测量模块 forward、保存输出激活并写
+`timing/<module>.time.json`。所有 readback / `into_data()` 都必须发生在 canonical /
+duplicate 判断之后。
 
-fn write_trace_time(path: &Path, filename: &str, elapsed_ns: u128) {
-    let mut time_path = path.to_owned();
-    time_path.set_extension("time.json");
-    write(
-        time_path,
-        format!(
-            r#"{{"filename":"{}","elapsed_ns":{},"repeat":1,"warmup":0,"samples_ns":[{}]}}"#,
-            filename, elapsed_ns, elapsed_ns
-        ),
-    )
-    .unwrap();
-}
-
-fn write_safetensor(path: &Path, name: String, dtype: SafeDtype, shape: Vec<usize>, bytes: &[u8]) {
-    create_dir_all(path.parent().unwrap()).unwrap();
-    let view = TensorView::new(dtype, shape, bytes).unwrap();
-    serialize_to_file([(name, view)], None, path).unwrap();
-}
-
-fn burn_dtype_to_safetensors_dtype(dtype: BurnDType) -> SafeDtype {
-    match dtype {
-        BurnDType::F64 => SafeDtype::F64,
-        BurnDType::F32 | BurnDType::Flex32 => SafeDtype::F32,
-        BurnDType::F16 => SafeDtype::F16,
-        BurnDType::BF16 => SafeDtype::BF16,
-        BurnDType::I64 => SafeDtype::I64,
-        BurnDType::I32 => SafeDtype::I32,
-        BurnDType::I16 => SafeDtype::I16,
-        BurnDType::I8 => SafeDtype::I8,
-        BurnDType::U64 => SafeDtype::U64,
-        BurnDType::U32 => SafeDtype::U32,
-        BurnDType::U16 => SafeDtype::U16,
-        BurnDType::U8 => SafeDtype::U8,
-        BurnDType::Bool => SafeDtype::BOOL,
-        BurnDType::QFloat(_) => panic!("quantized Burn TensorData has backend-specific layout"),
-    }
-}
-
-// for webgpu based by web-rwkv
-fn trace_webgpu<T, K>(output_path: &Path, filename: &str, tensor: TensorGpu<T, K>, elapsed_ns: u128)
-where
-    T: Scalar,
-    K: Kind,
-{
-    let path = output_path.join(filename);
-    let cpu = tensor.back_in_place();
-    let shape: [usize; 4] = cpu.shape().into();
-    let bytes = bytemuck::cast_slice(cpu.data().as_ref());
-    write_safetensor(&path, tensor_name(filename), T::DATA_TYPE, shape.to_vec(), bytes);
-    write_trace_time(&path, filename, elapsed_ns);
-}
-
-// for burn based by rwkv-rs
-fn trace_burn<B, const D: usize, K>(
-    output_path: &Path,
-    filename: &str,
-    tensor: Tensor<B, D, K>,
-    elapsed_ns: u128,
-)
-where
-    B: Backend,
-    K: TensorKind<B>,
-{
-    let path = output_path.join(filename);
-    let data = tensor.into_data();
-    let dtype = burn_dtype_to_safetensors_dtype(data.dtype);
-    let shape = data.shape.clone();
-    let bytes = data.as_bytes();
-    write_safetensor(
-        &path,
-        tensor_name(filename),
-        dtype,
-        shape,
-        bytes,
-    );
-    write_trace_time(&path, filename, elapsed_ns);
-}
-
-// usage:
-// let start = Instant::now();
-// let y = run_time_mixer(x);
-// let elapsed_ns = start.elapsed().as_nanos();
-// trace_webgpu(case_root, "cells/cell_0000/time_mixer/embedded_context.safetensors", y, elapsed_ns);
-```
-
-### C++
-
-```cpp
-#include <chrono>
-#include <cstdint>
-#include <filesystem>
-#include <fstream>
-#include <stdexcept>
-#include <string>
-#include <vector>
-
-#include "ggml.h"
-#include "ggml-backend.h"
-#include "safetensors.hh" // syoyo/safetensors-cpp
-#include <torch/torch.h>
-
-static std::string tensor_name(const std::string & filename) {
-    return std::filesystem::path(filename).stem().string();
-}
-
-static void write_trace_time(
-    const std::filesystem::path & path,
-    const std::string & filename,
-    long long elapsed_ns
-) {
-    auto time_path = path;
-    time_path.replace_extension("time.json");
-    std::ofstream out(time_path);
-    out << "{\"filename\":\"" << filename << "\",\"elapsed_ns\":" << elapsed_ns
-        << ",\"repeat\":1,\"warmup\":0,\"samples_ns\":[" << elapsed_ns << "]}";
-}
-
-static safetensors::dtype ggml_dtype(enum ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_F32:  return safetensors::dtype::kFLOAT32;
-        case GGML_TYPE_F16:  return safetensors::dtype::kFLOAT16;
-        case GGML_TYPE_BF16: return safetensors::dtype::kBFLOAT16;
-        case GGML_TYPE_I32:  return safetensors::dtype::kINT32;
-        case GGML_TYPE_I16:  return safetensors::dtype::kINT16;
-        case GGML_TYPE_I8:   return safetensors::dtype::kINT8;
-        default: throw std::runtime_error("unsupported ggml dtype for safetensors trace");
-    }
-}
-
-static safetensors::dtype torch_dtype(torch::ScalarType type) {
-    switch (type) {
-        case torch::kFloat64:  return safetensors::dtype::kFLOAT64;
-        case torch::kFloat32:  return safetensors::dtype::kFLOAT32;
-        case torch::kFloat16:  return safetensors::dtype::kFLOAT16;
-        case torch::kBFloat16: return safetensors::dtype::kBFLOAT16;
-        case torch::kInt64:    return safetensors::dtype::kINT64;
-        case torch::kInt32:    return safetensors::dtype::kINT32;
-        case torch::kInt16:    return safetensors::dtype::kINT16;
-        case torch::kInt8:     return safetensors::dtype::kINT8;
-        case torch::kUInt8:    return safetensors::dtype::kUINT8;
-        case torch::kBool:     return safetensors::dtype::kBOOL;
-        default: throw std::runtime_error("unsupported torch dtype for safetensors trace");
-    }
-}
-
-static void save_safetensor(
-    const std::filesystem::path & path,
-    const std::string & name,
-    safetensors::dtype dtype,
-    const std::vector<size_t> & shape,
-    const std::vector<uint8_t> & bytes
-) {
-    std::filesystem::create_directories(path.parent_path());
-    safetensors::safetensors_t st;
-    safetensors::tensor_t t;
-    t.dtype = dtype;
-    t.shape = shape;
-    t.data_offsets = {0, bytes.size()};
-    st.tensors[name] = t;
-    st.storage = bytes;
-
-    std::string warn;
-    std::string err;
-    const bool ok = safetensors::save_to_file(st, path.string(), &warn, &err);
-    if (!ok) {
-        throw std::runtime_error(err);
-    }
-}
-
-// for llama.cpp / ggml
-static void trace_ggml(
-    const std::filesystem::path & output_path,
-    const std::string & filename,
-    const ggml_tensor * tensor,
-    long long elapsed_ns
-) {
-    const auto path = output_path / filename;
-
-    std::vector<size_t> shape;
-    for (int i = ggml_n_dims(tensor) - 1; i >= 0; --i) {
-        shape.push_back(static_cast<size_t>(tensor->ne[i]));
-    }
-
-    std::vector<uint8_t> bytes(ggml_nbytes(tensor));
-    ggml_backend_tensor_get(tensor, bytes.data(), 0, bytes.size());
-    save_safetensor(path, tensor_name(filename), ggml_dtype(tensor->type), shape, bytes);
-    write_trace_time(path, filename, elapsed_ns);
-}
-
-// for libtorch
-static void trace_libtorch(
-    const std::filesystem::path & output_path,
-    const std::string & filename,
-    const torch::Tensor & tensor,
-    long long elapsed_ns
-) {
-    const auto path = output_path / filename;
-
-    TORCH_CHECK(tensor.is_contiguous(), "trace_libtorch requires a contiguous tensor");
-    const torch::Tensor host = tensor.device().is_cpu() ? tensor : tensor.cpu();
-
-    std::vector<size_t> shape;
-    for (const auto dim : host.sizes()) {
-        shape.push_back(static_cast<size_t>(dim));
-    }
-
-    const auto nbytes = static_cast<size_t>(host.nbytes());
-    const auto * ptr = static_cast<const uint8_t *>(host.const_data_ptr());
-    std::vector<uint8_t> bytes(ptr, ptr + nbytes);
-    save_safetensor(path, tensor_name(filename), torch_dtype(host.scalar_type()), shape, bytes);
-    write_trace_time(path, filename, elapsed_ns);
-}
-
-// usage:
-// trace_ggml(case_root, "lm_head/logits.safetensors", logits, lm_head_elapsed_ns);
-// trace_libtorch(case_root, "lm_head/logits.safetensors", logits, lm_head_elapsed_ns);
-```
+C++ helper 也使用 `TraceWriter` 维护已保存 tensor key。ggml / libtorch 都能构造 runtime
+identity，不需要读回 tensor 内容；但 libtorch 没有统一暴露 Python `_version` 等价物，
+已登记 tensor 不应再被 in-place 改写，或由调用点扩展 key 加显式 generation。libtorch
+调用点传入被测 lambda、`outputs(out<0>("..."))` 和需要同步的输入 tensor，
+`trace_libtorch` 在内部完成同步、计时、执行、输出保存和模块 timing 写入。
 
 llama.cpp 的 `cb_eval` 只能在 scheduler 观察到某个 graph tensor 时回调。用于逐模块耗时
 对比时，计时必须夹在命中 observed node 的 `ask=true` 和对应 `ask=false` 之间，也就是
-记录 scheduler 计算到该 tensor 并同步完成的 graph segment 耗时；不要在
-`trace_ggml` / `trace_bytes` / safetensors 写入 helper 内部计时。旧版
+记录 scheduler 计算到该 tensor 并同步完成的 graph segment 耗时；`trace_ggml`
+只能接收这个边界已经测出的 module elapsed_ns，再负责输出激活保存和模块 timing
+写入；不要在 `activation_ggml` / `trace_bytes` / safetensors 写入 helper 内部计时。旧版
 `test_gen/llama_cpp/fp16/case_000000` 若由写文件 helper 计时生成，其 `.time.json` 只代表
 导出耗时，必须重新导出。
 
-### Python
-
-```python
-from pathlib import Path
-import json
-
-import torch
-from safetensors.torch import save_file
-
-
-def trace(output_path: str | Path, filename: str, tensor: torch.Tensor, elapsed_ns: int) -> None:
-    path = Path(output_path) / filename
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    view = tensor.detach()
-    if not view.is_contiguous():
-        raise RuntimeError("trace requires a contiguous torch.Tensor")
-    save_file({path.stem: view}, path)
-
-    path.with_suffix(".time.json").write_text(
-        json.dumps(
-            {
-                "filename": filename,
-                "elapsed_ns": elapsed_ns,
-                "repeat": 1,
-                "warmup": 0,
-                "samples_ns": [elapsed_ns],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-
-# usage:
-# output, elapsed_ns = measure(lambda: time_mixer(x))
-# trace(case_root, "cells/cell_0000/time_mixer/embedded_context.safetensors", output, elapsed_ns)
-```
+Python helper 必须以 trace contract 的 canonical path 为准，不能用“谁先保存谁赢”决定输出
+文件名。已保存 tensor 再以输入/别名路径传入时可以自动跳过；但一个未保存 tensor 如果传入
+非 canonical path，必须报错。这样导出的 `.safetensors` 相对路径集合仍然天然适配
+`rwkv-test compare` 的同名文件对齐模型。
 
 ## Trace 运行规则
 
@@ -343,7 +106,7 @@ TRACE_REPEAT=3 TRACE_WARMUP=1 bash scripts/export_trace_average.sh
 ```
 
 该脚本逐后端运行原有真实入口多次，用仓库内 staging 目录收集中间结果，校验每次导出的
-`.time.json` 集合一致，然后把最后一次 tensor 数据和平均后的 `.time.json` 写回
+`timing/**/*.time.json` 集合一致，然后把最后一次 tensor 数据和平均后的模块 timing 写回
 `test_gen/<repo_name>/<quantization_name>/case_000000`。
 
 ### Trace 行为

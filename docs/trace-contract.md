@@ -29,9 +29,22 @@ test_gen
             │   │   └── ...
             │   └── cell_<n_layer_minus_1>/
             │       └── ...
-            └── lm_head/
-                ├── embedded_context.safetensors
-                └── logits.safetensors
+            ├── lm_head/
+            │   ├── embedded_context.safetensors
+            │   └── logits.safetensors
+            └── timing/
+                ├── embedding.time.json
+                ├── layer_norm0.time.json
+                ├── cells/
+                │   ├── cell_0000/
+                │   │   ├── pre_layer_norm_for_time_mix.time.json
+                │   │   ├── time_mixer.time.json
+                │   │   ├── embedded_context_after_time_mixer.time.json
+                │   │   ├── pre_layer_norm_for_channel_mix.time.json
+                │   │   ├── channel_mixer.time.json
+                │   │   └── embedded_context_after_channel_mixer.time.json
+                │   └── ...
+                └── lm_head.time.json
 ```
 
 ## 命名规则
@@ -40,6 +53,11 @@ test_gen
 - `albatross` 只使用 `fp16`：`test_gen/albatross/fp16/...`
 - 其它量化方案使用 `llama.cpp` 风格 `snake_case` 命名，例如 `q8_0`、`q4_k_m`、`q5_k_m`。
 - 每个 `.safetensors` 文件只保存一个同名 tensor，`dtype` 必须保持导出时原样。
+- `.time.json` 只允许出现在 `timing/` 目录下，文件名来自模块名，不来自激活值名。
+- 禁止生成激活值同名 timing，例如 `embedding/token_ids.time.json` 或
+  `cells/cell_0000/time_mixer/embedded_context.time.json`。
+- timing JSON 使用 `module` 字段标识模块，例如 `cells/cell_0000/time_mixer`，不使用
+  `.safetensors` 的 `filename` 字段。
 
 ## 语义约定
 
@@ -52,14 +70,17 @@ test_gen
 - `channel_mixer/embedded_context` 是 CMix 残差分支输出。
 - `embedded_context_after_channel_mixer` 是当前 cell 输出，也是下一层 cell 输入。
 - `lm_head/embedded_context` 是 LMHead 输入，`lm_head/logits` 是 LMHead 输出。
-- 训练 trace 和推理 trace 的导出集合不同。训练 trace 必须仍然从原训练入口跑一个真实
-  `training_step`，但测试目标是训练路径 custom CUDA kernel 的输出，而不是推理式 logits
-  对齐。
-- `lm_head/logits` 只属于推理 prefill 或显式 logits 对齐 case；`rwkv_lm` 训练 trace 不要求导出 `lm_head/logits`。
-- `rwkv_lm` 训练 trace 至少导出 custom kernel 主输出：
-  `cells/cell_*/time_mixer/embedded_context.safetensors`、
-  `cells/cell_*/channel_mixer/embedded_context.safetensors`、
-  `loss/l2wrap_cross_entropy.safetensors`。启用 `--head_chunk > 0` 时，训练 trace 改为导出
-  `loss/head_l2wrap_cross_entropy.safetensors` 作为 fused head+CE kernel 主输出。
-- 一个 CUDA kernel 返回多个 tensor 时，所有导出的 tensor 都必须写同一个真实 kernel compute
-  边界耗时；测试/汇总层可以只选择主输出做性能聚合，但不得通过给辅助输出写 `0` 来避免重复汇总。
+
+## 耗时约定
+
+- 耗时描述模块 forward，不描述某个激活值。
+- 输入激活没有独立 forward 耗时，只导出 `.safetensors`，不写 `elapsed_ns=0`。
+- 一个模块返回多个激活值时，只写一个模块 timing；不要把同一个耗时复制到多个输出 tensor。
+- 别名/透传 tensor 和辅助输出不靠 `0` 耗时占位；需要性能比较时，必须定义清楚对应模块边界。
+
+
+## 边界原则
+- 训练 baseline 是 rwkv-lm，推理 baseline 是 albatross
+- 导出集合由 baseline 的真实执行路径决定，不强行制造某个 backend 没有自然暴露的中间结果
+- 不导出某个 kernel 的内部中间运行结果；只导出真实被调用 kernel 的输入/输出边界
+- 一个被使用的 kernel 返回多个 tensor，这些 tensor 都属于契约，必须导出并参与同名对比
