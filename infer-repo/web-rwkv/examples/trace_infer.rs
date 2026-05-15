@@ -252,19 +252,6 @@ fn build_hooks(
 
     for layer in 0..info.num_layer {
         let filename =
-            format!("cells/cell_{layer:04}/pre_layer_norm_for_time_mix/embedded_context.safetensors");
-        let target = snapshot_f16(
-            context,
-            &mut snapshots,
-            filename.clone(),
-            hidden_shape,
-        );
-        hooks.insert(
-            v7::Hook::PostAttLayerNorm(layer),
-            Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.att_x, &target)),
-        );
-
-        let filename =
             format!("cells/cell_{layer:04}/time_mixer/value_from_first_cell.safetensors");
         let target = snapshot_f16(
             context,
@@ -300,20 +287,6 @@ fn build_hooks(
         hooks.insert(
             v7::Hook::PostAtt(layer),
             Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.x, &target)),
-        );
-
-        let filename = format!(
-            "cells/cell_{layer:04}/pre_layer_norm_for_channel_mix/embedded_context.safetensors"
-        );
-        let target = snapshot_f16(
-            context,
-            &mut snapshots,
-            filename.clone(),
-            hidden_shape,
-        );
-        hooks.insert(
-            v7::Hook::PostFfnLayerNorm(layer),
-            Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.ffn_x, &target)),
         );
 
         let filename = format!("cells/cell_{layer:04}/channel_mixer/embedded_context.safetensors");

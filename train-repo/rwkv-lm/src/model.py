@@ -3,14 +3,13 @@
 ########################################################################################################
 
 import os, sys, math, gc, importlib
-from time import perf_counter_ns
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
 from pytorch_lightning.strategies import DeepSpeedStrategy
-from .trace import enabled as trace_enabled, trace, trace_cell
+from .trace import activation, trace
 if importlib.util.find_spec('deepspeed'):
     import deepspeed
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
@@ -26,16 +25,6 @@ except:
 
 def __nop(ob):
     return ob
-
-
-def _trace_sync(*values):
-    if not trace_enabled():
-        return
-    for value in values:
-        if isinstance(value, torch.Tensor) and value.device.type == "cuda":
-            torch.cuda.synchronize(value.device)
-        elif isinstance(value, (tuple, list)):
-            _trace_sync(*value)
 
 
 MyModule = nn.Module
@@ -404,18 +393,16 @@ class L2WrapCrossEntropyCUDA(torch.autograd.Function):
     def forward(ctx, logits, targets):
         logits = logits.contiguous()
         targets = targets.contiguous()
-        elapsed_ns = 0
-        if trace_enabled():
-            _trace_sync(logits, targets)
-            start = perf_counter_ns()
-        loss, lse, max_vals, argmax = L2WRAP_CE_CUDA_V2.forward(logits, targets)
-        if trace_enabled():
-            _trace_sync(loss, lse, max_vals, argmax)
-            elapsed_ns = perf_counter_ns() - start
-            trace("loss/l2wrap_cross_entropy.safetensors", loss.reshape(1), elapsed_ns)
-            trace("loss/l2wrap_cross_entropy/lse.safetensors", lse, elapsed_ns)
-            trace("loss/l2wrap_cross_entropy/max_vals.safetensors", max_vals, elapsed_ns)
-            trace("loss/l2wrap_cross_entropy/argmax.safetensors", argmax, elapsed_ns)
+        loss, lse, max_vals, argmax = trace(
+            "loss/l2wrap_cross_entropy",
+            lambda: L2WRAP_CE_CUDA_V2.forward(logits, targets),
+            outputs={
+                lambda output: output[0].reshape(1): "loss/l2wrap_cross_entropy.safetensors",
+                1: "loss/l2wrap_cross_entropy/lse.safetensors",
+                2: "loss/l2wrap_cross_entropy/max_vals.safetensors",
+                3: "loss/l2wrap_cross_entropy/argmax.safetensors",
+            },
+        )
         ctx.save_for_backward(logits, targets.view(-1), lse, max_vals, argmax)
         return loss
 
@@ -449,22 +436,20 @@ if int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"]) > 0:
             hidden = hidden.contiguous()
             weight = weight.contiguous()
             targets = targets.contiguous()
-            elapsed_ns = 0
-            if trace_enabled():
-                _trace_sync(hidden, weight, targets)
-                start = perf_counter_ns()
-            loss, grad_hidden, grad_weight = HEAD_L2WRAP_CE_CUDA_V4.forward(
-                hidden,
-                weight,
-                targets,
-                HEAD_L2WRAP_CE_CHUNK,
+            loss, grad_hidden, grad_weight = trace(
+                "loss/head_l2wrap_cross_entropy",
+                lambda: HEAD_L2WRAP_CE_CUDA_V4.forward(
+                    hidden,
+                    weight,
+                    targets,
+                    HEAD_L2WRAP_CE_CHUNK,
+                ),
+                outputs={
+                    lambda output: output[0].reshape(1): "loss/head_l2wrap_cross_entropy.safetensors",
+                    1: "loss/head_l2wrap_cross_entropy/grad_hidden.safetensors",
+                    2: "loss/head_l2wrap_cross_entropy/grad_weight.safetensors",
+                },
             )
-            if trace_enabled():
-                _trace_sync(loss, grad_hidden, grad_weight)
-                elapsed_ns = perf_counter_ns() - start
-                trace("loss/head_l2wrap_cross_entropy.safetensors", loss.reshape(1), elapsed_ns)
-                trace("loss/head_l2wrap_cross_entropy/grad_hidden.safetensors", grad_hidden, elapsed_ns)
-                trace("loss/head_l2wrap_cross_entropy/grad_weight.safetensors", grad_weight, elapsed_ns)
             ctx.save_for_backward(grad_hidden, grad_weight)
             return loss
 
@@ -572,10 +557,6 @@ class RWKV_Tmix_x070(MyModule):
     def forward(self, x, v_first):
         B, T, C = x.size()
         H = self.n_head
-        time_mixer_start = 0
-        if trace_enabled():
-            _trace_sync(x, v_first)
-            time_mixer_start = perf_counter_ns()
 
         ############################################################
         # slow pytorch version
@@ -602,18 +583,9 @@ class RWKV_Tmix_x070(MyModule):
         r = self.receptance(xr)
         w = self.w0 + torch.tanh(xw @ self.w1) @ self.w2 # will be soft-clamped to (-inf, -0.5) and exp(-exp(w)) in RWKV7_CLAMPW_CUDA kernel
         k = self.key(xk)
-        value_elapsed_ns = 0
-        value_trace = v_first
-        if trace_enabled() and self.layer_id == 0:
-            _trace_sync(xv)
-            value_start = perf_counter_ns()
         v = self.value(xv)
         if self.layer_id == 0:
             v_first = v # store the v of the first layer
-            value_trace = v_first
-            if trace_enabled():
-                _trace_sync(v_first)
-                value_elapsed_ns = perf_counter_ns() - value_start
         else:
             ############################################################
             # slow pytorch version
@@ -623,14 +595,6 @@ class RWKV_Tmix_x070(MyModule):
             v12 = (xv @ self.v1) @ self.v2
             v = tmix_vres_gate_bf16_v1(v, v_first, self.v0, v12) # add value residual
             ############################################################
-            if trace_enabled():
-                _trace_sync(v_first)
-                value_start = perf_counter_ns()
-                value_trace = v_first.contiguous().clone()
-                _trace_sync(value_trace)
-                value_elapsed_ns = perf_counter_ns() - value_start
-
-        trace_cell(self.layer_id, "time_mixer/value_from_first_cell.safetensors", value_trace, value_elapsed_ns)
 
         ############################################################
         # slow pytorch version
@@ -677,11 +641,6 @@ class RWKV_Tmix_x070(MyModule):
                 g,
         )
         x = self.output(x)
-        time_mixer_elapsed_ns = 0
-        if trace_enabled():
-            _trace_sync(x)
-            time_mixer_elapsed_ns = perf_counter_ns() - time_mixer_start
-        trace_cell(self.layer_id, "time_mixer/embedded_context.safetensors", x, time_mixer_elapsed_ns)
         ############################################################
 
         return x, v_first
@@ -760,67 +719,49 @@ class Block(nn.Module):
 
     def forward(self, x, v_first):
         if self.layer_id == 0:
-            elapsed_ns = 0
-            if trace_enabled():
-                _trace_sync(x)
-                start = perf_counter_ns()
-            x = self.ln0(x)
-            if trace_enabled():
-                _trace_sync(x)
-                elapsed_ns = perf_counter_ns() - start
-            trace("layer_norm0/embedded_context.safetensors", x, elapsed_ns)
+            x = trace("layer_norm0", lambda: self.ln0(x), outputs="layer_norm0/embedded_context.safetensors")
 
-        elapsed_ns = 0
-        if trace_enabled():
-            _trace_sync(x)
-            start = perf_counter_ns()
-        x_tmix = self.ln1(x)
-        if trace_enabled():
-            _trace_sync(x_tmix)
-            elapsed_ns = perf_counter_ns() - start
-        trace_cell(self.layer_id, "pre_layer_norm_for_time_mix/embedded_context.safetensors", x_tmix, elapsed_ns)
+        x_tmix = trace(
+            f"cells/cell_{self.layer_id:04d}/pre_layer_norm_for_time_mix",
+            lambda: self.ln1(x),
+        )
 
-        x_attn, v_first = self.att(x_tmix, v_first)
+        def time_mixer_forward():
+            x_attn, next_v_first = self.att(x_tmix, v_first)
+            value_trace = next_v_first if self.layer_id == 0 else next_v_first.contiguous().clone()
+            return x_attn, next_v_first, value_trace
 
-        elapsed_ns = 0
-        if trace_enabled():
-            _trace_sync(x, x_attn)
-            start = perf_counter_ns()
-        x = x + x_attn
-        if trace_enabled():
-            _trace_sync(x)
-            elapsed_ns = perf_counter_ns() - start
-        trace_cell(self.layer_id, "embedded_context_after_time_mixer.safetensors", x, elapsed_ns)
+        x_attn, v_first, _ = trace(
+            f"cells/cell_{self.layer_id:04d}/time_mixer",
+            time_mixer_forward,
+            outputs={
+                0: f"cells/cell_{self.layer_id:04d}/time_mixer/embedded_context.safetensors",
+                2: f"cells/cell_{self.layer_id:04d}/time_mixer/value_from_first_cell.safetensors",
+            },
+        )
 
-        elapsed_ns = 0
-        if trace_enabled():
-            _trace_sync(x)
-            start = perf_counter_ns()
-        x_cmix = self.ln2(x)
-        if trace_enabled():
-            _trace_sync(x_cmix)
-            elapsed_ns = perf_counter_ns() - start
-        trace_cell(self.layer_id, "pre_layer_norm_for_channel_mix/embedded_context.safetensors", x_cmix, elapsed_ns)
+        x = trace(
+            f"cells/cell_{self.layer_id:04d}/embedded_context_after_time_mixer",
+            lambda: x + x_attn,
+            outputs=f"cells/cell_{self.layer_id:04d}/embedded_context_after_time_mixer.safetensors",
+        )
 
-        elapsed_ns = 0
-        if trace_enabled():
-            _trace_sync(x_cmix)
-            start = perf_counter_ns()
-        x_ffn = self.ffn(x_cmix)
-        if trace_enabled():
-            _trace_sync(x_ffn)
-            elapsed_ns = perf_counter_ns() - start
-        trace_cell(self.layer_id, "channel_mixer/embedded_context.safetensors", x_ffn, elapsed_ns)
+        x_cmix = trace(
+            f"cells/cell_{self.layer_id:04d}/pre_layer_norm_for_channel_mix",
+            lambda: self.ln2(x),
+        )
 
-        elapsed_ns = 0
-        if trace_enabled():
-            _trace_sync(x, x_ffn)
-            start = perf_counter_ns()
-        x = x + x_ffn
-        if trace_enabled():
-            _trace_sync(x)
-            elapsed_ns = perf_counter_ns() - start
-        trace_cell(self.layer_id, "embedded_context_after_channel_mixer.safetensors", x, elapsed_ns)
+        x_ffn = trace(
+            f"cells/cell_{self.layer_id:04d}/channel_mixer",
+            lambda: self.ffn(x_cmix),
+            outputs=f"cells/cell_{self.layer_id:04d}/channel_mixer/embedded_context.safetensors",
+        )
+
+        x = trace(
+            f"cells/cell_{self.layer_id:04d}/embedded_context_after_channel_mixer",
+            lambda: x + x_ffn,
+            outputs=f"cells/cell_{self.layer_id:04d}/embedded_context_after_channel_mixer.safetensors",
+        )
         return x, v_first
 
 
@@ -912,16 +853,8 @@ class RWKV(pl.LightningModule):
         B, T = idx.size()
         assert T <= args.ctx_len, "Cannot forward, model ctx_len is exhausted."
 
-        trace("embedding/token_ids.safetensors", idx, 0)
-        elapsed_ns = 0
-        if trace_enabled():
-            _trace_sync(idx)
-            start = perf_counter_ns()
-        x = self.emb(idx)
-        if trace_enabled():
-            _trace_sync(x)
-            elapsed_ns = perf_counter_ns() - start
-        trace("embedding/embedded_context.safetensors", x, elapsed_ns)
+        activation("embedding/token_ids.safetensors", idx)
+        x = trace("embedding", lambda: self.emb(idx), outputs="embedding/embedded_context.safetensors")
 
         v_first = torch.empty_like(x)
         for block in self.blocks:
@@ -930,15 +863,7 @@ class RWKV(pl.LightningModule):
             else:
                 x, v_first = block(x, v_first)
 
-        elapsed_ns = 0
-        if trace_enabled():
-            _trace_sync(x)
-            start = perf_counter_ns()
-        x = self.ln_out(x)
-        if trace_enabled():
-            _trace_sync(x)
-            elapsed_ns = perf_counter_ns() - start
-        trace("lm_head/embedded_context.safetensors", x, elapsed_ns)
+        x = trace("lm_head", lambda: self.ln_out(x), outputs="lm_head/embedded_context.safetensors")
         return x
 
     if int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"]) > 0: # saves 70~80% VRAM
@@ -950,7 +875,7 @@ class RWKV(pl.LightningModule):
             idx, targets = batch
             hidden = self(idx)
             loss = head_l2wrap_cross_entropy(hidden, self.head.weight, targets)
-            if trace_enabled():
+            if os.environ.get("RWKV_TRACE_ONCE") == "1":
                 self._rwkv_trace_step_done = True
             return loss
 
@@ -971,7 +896,7 @@ class RWKV(pl.LightningModule):
             ############################################################
             # much faster CUDA version (!!! fixed 1e-4 factor !!!)
             loss = l2wrap_cross_entropy(logits, targets)
-            if trace_enabled():
+            if os.environ.get("RWKV_TRACE_ONCE") == "1":
                 self._rwkv_trace_step_done = True
             return loss
 

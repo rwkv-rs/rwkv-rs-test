@@ -11,18 +11,19 @@ from safetensors.torch import save_file
 
 
 TRACE = os.environ.get("RWKV_TRACE_ONCE") == "1"
+TRACE_REPEAT = int(os.environ.get("RWKV_TRACE_REPEAT", "3"))
+TRACE_WARMUP = int(os.environ.get("RWKV_TRACE_WARMUP", "1"))
 OutputSelector = Callable[[Any], torch.Tensor] | int | tuple[int, ...]
-TraceOutputs = str | Mapping[OutputSelector, str]
+TraceOutputs = str | Mapping[OutputSelector, str] | None
 TensorKey = tuple[str, torch.dtype, tuple[int, ...], tuple[int, ...], int, int, int]
 
-_SAVED_BY_KEY: dict[TensorKey, str] = {}
+_SAVED_BY_FILENAME: dict[str, TensorKey] = {}
+_LAST_SAMPLES_NS: list[int] = []
 _CANONICAL_CELL_RE = re.compile(
     r"^cells/cell_\d{4}/("
-    r"pre_layer_norm_for_time_mix/embedded_context|"
     r"time_mixer/value_from_first_cell|"
     r"time_mixer/embedded_context|"
     r"embedded_context_after_time_mixer|"
-    r"pre_layer_norm_for_channel_mix/embedded_context|"
     r"channel_mixer/embedded_context|"
     r"embedded_context_after_channel_mixer"
     r")\.safetensors$"
@@ -95,19 +96,15 @@ def _select(output: Any, selector: OutputSelector) -> torch.Tensor:
 def activation(filename: str, tensor: torch.Tensor) -> None:
     if not TRACE:
         return
-
-    key = _tensor_key(tensor)
-    saved_filename = _SAVED_BY_KEY.get(key)
-    if saved_filename == filename:
-        return
-    if saved_filename is not None:
-        if is_canonical_path(filename):
-            raise RuntimeError(
-                f"tensor already saved as {saved_filename}, cannot also save canonical {filename}"
-            )
-        return
     if not is_canonical_path(filename):
         raise RuntimeError(f"{filename} is not a canonical trace path")
+
+    key = _tensor_key(tensor)
+    saved_key = _SAVED_BY_FILENAME.get(filename)
+    if saved_key is not None:
+        if saved_key == key:
+            return
+        raise RuntimeError(f"{filename} already saved from a different tensor")
 
     path = case_root() / filename
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,7 +115,7 @@ def activation(filename: str, tensor: torch.Tensor) -> None:
     if view.device.type != "cpu":
         view = view.cpu()
     save_file({path.stem: view}, path)
-    _SAVED_BY_KEY[key] = filename
+    _SAVED_BY_FILENAME[filename] = key
 
 
 def timing(module: str, elapsed_ns: int) -> None:
@@ -134,9 +131,9 @@ def timing(module: str, elapsed_ns: int) -> None:
             {
                 "module": module,
                 "elapsed_ns": elapsed_ns,
-                "repeat": 1,
-                "warmup": 0,
-                "samples_ns": [elapsed_ns],
+                "repeat": TRACE_REPEAT,
+                "warmup": TRACE_WARMUP,
+                "samples_ns": _LAST_SAMPLES_NS,
             }
         ),
         encoding="utf-8",
@@ -144,6 +141,8 @@ def timing(module: str, elapsed_ns: int) -> None:
 
 
 def _write_outputs(outputs: TraceOutputs, result: Any) -> None:
+    if outputs is None:
+        return
     if isinstance(outputs, str):
         if not isinstance(result, torch.Tensor):
             raise RuntimeError("single-output trace requires a torch.Tensor result")
@@ -158,18 +157,35 @@ def trace(
     module: str,
     target: Callable[..., Any],
     *args: Any,
-    outputs: TraceOutputs,
+    outputs: TraceOutputs = None,
     **kwargs: Any,
 ) -> Any:
     if not TRACE:
         return target(*args, **kwargs)
+    if TRACE_REPEAT <= 0:
+        raise RuntimeError("RWKV_TRACE_REPEAT must be positive")
+    if TRACE_WARMUP < 0:
+        raise RuntimeError("RWKV_TRACE_WARMUP must be non-negative")
 
-    _sync_tensors(args)
-    _sync_tensors(kwargs)
-    start = perf_counter_ns()
-    result = target(*args, **kwargs)
-    _sync_tensors(result)
-    elapsed_ns = perf_counter_ns() - start
+    for _ in range(TRACE_WARMUP):
+        _sync_tensors(args)
+        _sync_tensors(kwargs)
+        warmup_result = target(*args, **kwargs)
+        _sync_tensors(warmup_result)
+
+    samples_ns: list[int] = []
+    result = None
+    for _ in range(TRACE_REPEAT):
+        _sync_tensors(args)
+        _sync_tensors(kwargs)
+        start = perf_counter_ns()
+        result = target(*args, **kwargs)
+        _sync_tensors(result)
+        samples_ns.append(perf_counter_ns() - start)
+
+    elapsed_ns = round(sum(samples_ns) / len(samples_ns))
+    global _LAST_SAMPLES_NS
+    _LAST_SAMPLES_NS = samples_ns
     _write_outputs(outputs, result)
     timing(module, elapsed_ns)
     return result

@@ -85,11 +85,9 @@ fn canonical_cell_path(filename: &str) -> bool {
         && cell.bytes().all(|b| b.is_ascii_digit())
         && matches!(
             name,
-            "pre_layer_norm_for_time_mix/embedded_context.safetensors"
-                | "time_mixer/value_from_first_cell.safetensors"
+            "time_mixer/value_from_first_cell.safetensors"
                 | "time_mixer/embedded_context.safetensors"
                 | "embedded_context_after_time_mixer.safetensors"
-                | "pre_layer_norm_for_channel_mix/embedded_context.safetensors"
                 | "channel_mixer/embedded_context.safetensors"
                 | "embedded_context_after_channel_mixer.safetensors"
         )

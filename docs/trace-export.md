@@ -21,16 +21,17 @@ safetensors 序列化或文件写入算进去；更不要把整段 prefill / tra
 边界和必要的设备同步。不会正确计时就不要写成 `0` 冒充有效 trace；该后端必须修正计时
 实现，或把对应模块标记为 unsupported 并拒绝产出 timing 结果。
 
-`elapsed_ns` 必须写平均耗时，不允许写单次运行的总耗时。平均口径是同一原始程序入口、
-同一输入、同一模型、同一设备同步边界下，跳过 `warmup` 次完整 trace run 后，对 `repeat`
-次完整 trace run 中同名模块 `.time.json` 的有效 `elapsed_ns` 做算术平均：
+`elapsed_ns` 必须写 warmup 后的平均耗时，不允许写冷启动单次耗时或总耗时。平均口径是
+同一个真实程序入口、同一输入、同一模型、同一设备同步边界下，在 `trace()` helper 内
+先执行 `warmup` 次被测 callable 且不计入样本，再执行 `repeat` 次被测 callable 并对
+这些原始样本做算术平均：
 
 ```text
 elapsed_ns = round(sum(samples_ns) / repeat)
 ```
 
-平均只跨完整 trace run，不在模型 forward 内重复执行某个子模块，也不按 token、batch
-element、hidden size 或输出元素数再除一次。每个模块 `.time.json` 必须同时写入：
+平均只跨同一模块 callable 的有效样本，不按 token、batch element、hidden size 或输出
+元素数再除一次。每个模块 `.time.json` 必须同时写入：
 
 - `module`：模块名，例如 `embedding`、`cells/cell_0000/time_mixer`。
 - `elapsed_ns`：平均后的 ns。
@@ -79,9 +80,10 @@ llama.cpp 的 `cb_eval` 只能在 scheduler 观察到某个 graph tensor 时回�
 导出耗时，必须重新导出。
 
 Python helper 必须以 trace contract 的 canonical path 为准，不能用“谁先保存谁赢”决定输出
-文件名。已保存 tensor 再以输入/别名路径传入时可以自动跳过；但一个未保存 tensor 如果传入
-非 canonical path，必须报错。这样导出的 `.safetensors` 相对路径集合仍然天然适配
-`rwkv-test compare` 的同名文件对齐模型。
+文件名，也不能用 CUDA `data_ptr` 做全局跨路径去重；PyTorch caching allocator 会复用
+storage 地址，按指针跳过会漏掉真实 canonical 输出。输入/别名激活必须在调用点不导出，
+helper 只负责校验 canonical path，并拒绝同一路径被不同 tensor 覆盖。这样导出的
+`.safetensors` 相对路径集合仍然天然适配 `rwkv-test compare` 的同名文件对齐模型。
 
 ## Trace 运行规则
 
@@ -91,23 +93,22 @@ Python helper 必须以 trace contract 的 canonical path 为准，不能用“�
 - 训练 repo：只跑 1 个真实 train step，完成该 step 的训练 kernel 输出和必要激活导出后退出（`L12-D768-CTX512-BSZ16`）。
 - 推理 repo：只跑 1 个真实 prefill step，完成该 prefill 的激活导出后退出。（`weights/rwkv7-g1f-1.5b-20260419-ctx8192.pth`，以及 `rwkv7-g1f-1.5b-*.gguf`。）
 - `rwkv-peft` 只跑 pretrain 路径，不是 LoRA / state tuning / SFT。
-- 所有 repo 使用同一个环境变量，例如：
+- 禁止创建专用 trace 程序入口。允许 shell wrapper 设置环境变量后调用真实 `train.py`、
+  benchmark、demo 或 binary；不允许重建 Trainer、DataLoader、ModelRunner、scheduler
+  或 model 加载流程来冒充真实入口。
+- 所有 repo 使用同一组环境变量，例如：
 
 ```bash
 RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen
 RWKV_TRACE_ONCE=1
+RWKV_TRACE_REPEAT=3
+RWKV_TRACE_WARMUP=1
 ```
 
 `RWKV_TRACE_ROOT` 负责指定导出根目录；`RWKV_TRACE_ONCE=1` 表示开启 trace，并在导出第一个完整训练 step 或第一个完整 prefill step 后退出。
-最终 trace 结果必须通过仓库根目录的平均导出脚本生成：
-
-```bash
-TRACE_REPEAT=3 TRACE_WARMUP=1 bash scripts/export_trace_average.sh
-```
-
-该脚本逐后端运行原有真实入口多次，用仓库内 staging 目录收集中间结果，校验每次导出的
-`timing/**/*.time.json` 集合一致，然后把最后一次 tensor 数据和平均后的模块 timing 写回
-`test_gen/<repo_name>/<quantization_name>/case_000000`。
+正式性能 trace 必须设置 `RWKV_TRACE_WARMUP>0` 且 `RWKV_TRACE_REPEAT>1`。单次 debug
+trace 可以显式设为 `RWKV_TRACE_WARMUP=0 RWKV_TRACE_REPEAT=1`，但不能把这种结果当作
+正式 speedup。
 
 ### Trace 行为
 
@@ -126,6 +127,11 @@ TRACE_REPEAT=3 TRACE_WARMUP=1 bash scripts/export_trace_average.sh
 ```
 
 不使用 `scripts/lora.sh`、`scripts/state tuning.sh`、`run_sft.sh` 的 PEFT 参数。插桩位置是 `rwkvt/rwkv7/model.py`、`block.py`、`att.py`、`ffn.py`，退出点放在 Lightning `training_step` / callback 层，保证只完成 1 个 train step。
+`rwkv-peft` 的未融合实现必须在 `block.py` 用外层 canonical module wrapper 聚合耗时：
+`self.att(...)` 整体对应 `cells/cell_XXXX/time_mixer`，`self.ffn(...)` 整体对应
+`cells/cell_XXXX/channel_mixer`。不要在 `att.py` / `ffn.py` 内部把未融合临时 op
+导出成新的 timing 或新的比较契约；也不要为了调试方便导出 `rwkv_lm` 训练 baseline
+没有的中间 tensor。
 
 ### 推理 Repo
 
@@ -150,10 +156,11 @@ cd train-repo/rwkv-lm
 RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen bash trace-train.sh
 ```
 
-上面的命令只用于单次调试。正式结果使用：
+正式结果使用同一个真实入口，只显式设置 warmup/repeat：
 
 ```bash
-TRACE_REPEAT=3 TRACE_WARMUP=1 bash scripts/export_trace_average.sh rwkv_lm
+RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen \
+RWKV_TRACE_WARMUP=1 RWKV_TRACE_REPEAT=3 bash trace-train.sh
 ```
 
 ### rwkv-peft pretrain
@@ -163,10 +170,11 @@ cd train-repo/rwkv-peft
 RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen bash trace-train.sh
 ```
 
-上面的命令只用于单次调试。正式结果使用：
+正式结果使用同一个真实入口，只显式设置 warmup/repeat：
 
 ```bash
-TRACE_REPEAT=3 TRACE_WARMUP=1 bash scripts/export_trace_average.sh rwkv_peft
+RWKV_TRACE_ROOT=/mnt/g/Projects/Packages/rwkv-rs-test/test_gen \
+RWKV_TRACE_WARMUP=1 RWKV_TRACE_REPEAT=3 bash trace-train.sh
 ```
 
 ### 推理 Repo
@@ -180,7 +188,7 @@ RWKV_TRACE_ONCE=1
 ```
 
 - 入口检测到 `RWKV_TRACE_ONCE=1` 后，只执行第一个真实 prefill，并在导出后结束进程或返回主函数。
-- Linux / WSL 中正式结果通过 `scripts/export_trace_average.sh albatross llama_cpp` 生成平均耗时。
+- Linux / WSL 中正式结果也由真实推理入口直接生成平均耗时；不要新增专用 trace runner。
 - `web_rwkv` 正式结果在 Windows 环境运行同一平均导出契约；不要用 WSL 下的 llvmpipe
   WebGPU fallback 结果覆盖 `test_gen/web_rwkv/fp16/case_000000`。
   Windows 下如果 Dx12 adapter 不暴露 `SUBGROUP` feature，`web_rwkv` trace 使用

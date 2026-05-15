@@ -14,14 +14,10 @@ test_gen
             │   └── embedded_context.safetensors
             ├── cells/
             │   ├── cell_0000/
-            │   │   ├── pre_layer_norm_for_time_mix/
-            │   │   │   └── embedded_context.safetensors
             │   │   ├── time_mixer/
             │   │   │   ├── value_from_first_cell.safetensors
             │   │   │   └── embedded_context.safetensors
             │   │   ├── embedded_context_after_time_mixer.safetensors
-            │   │   ├── pre_layer_norm_for_channel_mix/
-            │   │   │   └── embedded_context.safetensors
             │   │   ├── channel_mixer/
             │   │   │   └── embedded_context.safetensors
             │   │   └── embedded_context_after_channel_mixer.safetensors
@@ -63,10 +59,12 @@ test_gen
 
 - `embedding/embedded_context` 是 Embedding 输出，也是 `layer_norm0` 输入，不重复保存。
 - `layer_norm0/embedded_context` 是 `cell_0000` 的残差前输入。
-- `pre_layer_norm_for_time_mix/embedded_context` 是 TMix 的 norm 后输入。
+- `pre_layer_norm_for_time_mix` 只写 LayerNorm 模块 timing；它的输入已由上一个
+  canonical 激活表示，不再另存一份输入激活。
 - `time_mixer/embedded_context` 是 TMix 残差分支输出。
 - `embedded_context_after_time_mixer` 是 TMix 残差后的 CMix norm 前输入。
-- `pre_layer_norm_for_channel_mix/embedded_context` 是 CMix 的 norm 后输入。
+- `pre_layer_norm_for_channel_mix` 只写 LayerNorm 模块 timing；它的输入就是
+  `embedded_context_after_time_mixer`，不再另存一份输入激活。
 - `channel_mixer/embedded_context` 是 CMix 残差分支输出。
 - `embedded_context_after_channel_mixer` 是当前 cell 输出，也是下一层 cell 输入。
 - `lm_head/embedded_context` 是 LMHead 输入，`lm_head/logits` 是 LMHead 输出。

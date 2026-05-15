@@ -23,7 +23,7 @@ class RwkvLmStaticContractTests(unittest.TestCase):
         self.assertIn('parser.add_argument("--kernel"', train)
         self.assertIn('os.environ["RWKV_KERNEL"] = args.kernel', train)
         self.assertIn('os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"] = str(args.head_chunk)', train)
-        self.assertIn('if os.environ.get("RWKV_TRACE_ONCE") == "1":', train)
+        self.assertIn('trace_once = os.environ.get("RWKV_TRACE_ONCE") == "1"', train)
         self.assertIn("args.grad_cp = 0", train)
         self.assertIn('os.environ["RWKV_JIT_ON"] = "0"', train)
 
@@ -47,33 +47,51 @@ class RwkvLmStaticContractTests(unittest.TestCase):
         present = [path for path in obsolete if (ROOT / path).exists()]
         self.assertEqual(present, [])
 
-    def test_trace_helper_only_writes_passed_elapsed_ns(self):
+    def test_trace_helper_owns_module_timing_and_activations(self):
         trace = read("src/trace.py")
 
-        self.assertIn("def trace(filename: str, tensor: torch.Tensor, elapsed_ns: int = 0)", trace)
-        self.assertIn("def trace_cell(layer_id: int, filename: str, tensor: torch.Tensor, elapsed_ns: int = 0)", trace)
+        self.assertIn("def activation(filename: str, tensor: torch.Tensor) -> None:", trace)
+        self.assertIn("def timing(module: str, elapsed_ns: int) -> None:", trace)
+        self.assertIn("def trace(", trace)
+        self.assertIn('case_root() / "timing" / f"{module}.time.json"', trace)
+        self.assertIn('"module": module', trace)
+        self.assertIn('"samples_ns": _LAST_SAMPLES_NS', trace)
+        self.assertIn('TRACE_REPEAT = int(os.environ.get("RWKV_TRACE_REPEAT", "3"))', trace)
+        self.assertIn('TRACE_WARMUP = int(os.environ.get("RWKV_TRACE_WARMUP", "1"))', trace)
+        self.assertIn("for _ in range(TRACE_WARMUP):", trace)
+        self.assertIn("for _ in range(TRACE_REPEAT):", trace)
+        self.assertNotIn("def trace_cell(", trace)
         self.assertNotIn("def measure(", trace)
         self.assertNotIn("def timer_start(", trace)
         self.assertNotIn("def timer_elapsed(", trace)
-        self.assertNotIn("perf_counter_ns", trace)
 
-    def test_model_uses_new_forward_shape_and_inline_timing(self):
+    def test_model_uses_callable_trace_without_old_elapsed_api(self):
         model = read("src/model.py")
 
         self.assertIn("def _forward_features(self, idx):", model)
         self.assertIn("def head_l2wrap_cross_entropy(hidden, weight, targets):", model)
         self.assertIn('if int(os.environ["RWKV_HEAD_L2WRAP_CE_CHUNK"]) > 0:', model)
-        self.assertIn("trace(\"embedding/token_ids.safetensors\", idx, 0)", model)
-        self.assertIn("trace(\"loss/l2wrap_cross_entropy.safetensors\", loss.reshape(1), elapsed_ns)", model)
-        self.assertIn("trace(\"loss/head_l2wrap_cross_entropy.safetensors\", loss.reshape(1), elapsed_ns)", model)
+        self.assertIn('activation("embedding/token_ids.safetensors", idx)', model)
+        self.assertIn('trace("embedding"', model)
+        self.assertIn('f"cells/cell_{self.layer_id:04d}/time_mixer"', model)
+        self.assertIn('f"cells/cell_{self.layer_id:04d}/channel_mixer"', model)
+        self.assertIn('"loss/l2wrap_cross_entropy"', model)
+        self.assertIn('"loss/head_l2wrap_cross_entropy"', model)
         self.assertNotIn("trace(\"lm_head/logits.safetensors\"", model)
-        self.assertIn("torch.cuda.synchronize", model)
         self.assertNotIn("measure(", model)
         self.assertNotIn("timer_start(", model)
         self.assertNotIn("timer_elapsed(", model)
+        self.assertNotIn("trace_cell(", model)
+        self.assertNotIn("elapsed_ns", model)
 
         single_use_forward_helpers = re.findall(r"def _[a-z0-9_]+_forward_op\(", model)
         self.assertEqual(single_use_forward_helpers, [])
+
+    def test_no_activation_sidecar_timing_contract_remains(self):
+        trace = read("src/trace.py")
+
+        self.assertNotIn('with_suffix(".time.json")', trace)
+        self.assertNotIn('"filename": filename', trace)
 
     def test_readme_defines_training_kernel_trace_contract(self):
         readme = read_workspace("README.md")

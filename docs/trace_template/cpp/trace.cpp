@@ -40,11 +40,9 @@ static bool canonical_cell_path(const std::string & filename) {
         }
     }
     const std::string name = rest.substr(slash + 1);
-    return name == "pre_layer_norm_for_time_mix/embedded_context.safetensors"
-        || name == "time_mixer/value_from_first_cell.safetensors"
+    return name == "time_mixer/value_from_first_cell.safetensors"
         || name == "time_mixer/embedded_context.safetensors"
         || name == "embedded_context_after_time_mixer.safetensors"
-        || name == "pre_layer_norm_for_channel_mix/embedded_context.safetensors"
         || name == "channel_mixer/embedded_context.safetensors"
         || name == "embedded_context_after_channel_mixer.safetensors";
 }

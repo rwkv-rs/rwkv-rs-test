@@ -344,8 +344,6 @@ class RWKV_x070(MyModule):
                 ffn = f'blocks.{i}.ffn.'
 
                 xx, elapsed_ns = measure(lambda: F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln1.weight'], bias=z[bbb+'ln1.bias']), x)
-                if TRACE_ENABLED:
-                    trace_tensor(f"cells/cell_{i:04d}/pre_layer_norm_for_time_mix/embedded_context.safetensors", xx.contiguous(), elapsed_ns)
                 (xx, v_first), elapsed_ns = measure(lambda: RWKV_x070_TMix_seq(i, self.n_head, self.head_size, xx, state[3*i], v_first, state[3*i+1],
                     z[att+'x_r'], z[att+'x_w'], z[att+'x_k'], z[att+'x_v'], z[att+'x_a'], z[att+'x_g'],
                     z[att+'w0'], z[att+'w1'], z[att+'w2'], z[att+'a0'], z[att+'a1'], z[att+'a2'], z[att+'v0'], z[att+'v1'], z[att+'v2'],
@@ -361,8 +359,6 @@ class RWKV_x070(MyModule):
                     trace_tensor(f"cells/cell_{i:04d}/embedded_context_after_time_mixer.safetensors", x.contiguous(), elapsed_ns)
 
                 xx, elapsed_ns = measure(lambda: F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln2.weight'], bias=z[bbb+'ln2.bias']), x)
-                if TRACE_ENABLED:
-                    trace_tensor(f"cells/cell_{i:04d}/pre_layer_norm_for_channel_mix/embedded_context.safetensors", xx.contiguous(), elapsed_ns)
 
                 xx, elapsed_ns = measure(lambda: RWKV_x070_CMix_seq(xx, state[3*i+2], z[ffn+'x_k'], z[ffn+'key.weight'], z[ffn+'value.weight']), xx)
                 if TRACE_ENABLED:
@@ -432,8 +428,6 @@ class RWKV_x070(MyModule):
                 ffn = f'blocks.{i}.ffn.'
 
                 xx, elapsed_ns = measure(lambda: F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln1.weight'], bias=z[bbb+'ln1.bias']), x)
-                if TRACE_ENABLED:
-                    trace_tensor(f"cells/cell_{i:04d}/pre_layer_norm_for_time_mix/embedded_context.safetensors", xx.contiguous(), elapsed_ns)
                 (xx, v_first), elapsed_ns = measure(lambda: RWKV_x070_TMix_seq_batch(i, self.n_head, self.head_size, xx, state[3*i], v_first, state[3*i+1],
                     z[att+'x_r'], z[att+'x_w'], z[att+'x_k'], z[att+'x_v'], z[att+'x_a'], z[att+'x_g'],
                     z[att+'w0'], z[att+'w1'], z[att+'w2'], z[att+'a0'], z[att+'a1'], z[att+'a2'], z[att+'v0'], z[att+'v1'], z[att+'v2'],
@@ -449,8 +443,6 @@ class RWKV_x070(MyModule):
                     trace_tensor(f"cells/cell_{i:04d}/embedded_context_after_time_mixer.safetensors", x.contiguous(), elapsed_ns)
 
                 xx, elapsed_ns = measure(lambda: F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln2.weight'], bias=z[bbb+'ln2.bias']), x)
-                if TRACE_ENABLED:
-                    trace_tensor(f"cells/cell_{i:04d}/pre_layer_norm_for_channel_mix/embedded_context.safetensors", xx.contiguous(), elapsed_ns)
 
                 xx, elapsed_ns = measure(lambda: RWKV_x070_CMix_seq_batch(xx, state[3*i+2], z[ffn+'x_k'], z[ffn+'key.weight'], z[ffn+'value.weight']), xx)
                 if TRACE_ENABLED:

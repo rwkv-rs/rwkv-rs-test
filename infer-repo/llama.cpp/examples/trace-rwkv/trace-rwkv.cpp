@@ -203,11 +203,9 @@ static std::map<std::string, std::string> make_node_map(int n_layer) {
         char cell_prefix[64];
         snprintf(node_prefix, sizeof(node_prefix), "rwkv.%02d", il);
         snprintf(cell_prefix, sizeof(cell_prefix), "cells/cell_%04d", il);
-        out[std::string(node_prefix) + ".t_ln"]       = std::string(cell_prefix) + "/pre_layer_norm_for_time_mix/embedded_context.safetensors";
         out[std::string(node_prefix) + ".v_first"]    = std::string(cell_prefix) + "/time_mixer/value_from_first_cell.safetensors";
         out[std::string(node_prefix) + ".tmix"]       = std::string(cell_prefix) + "/time_mixer/embedded_context.safetensors";
         out[std::string(node_prefix) + ".after_tmix"] = std::string(cell_prefix) + "/embedded_context_after_time_mixer.safetensors";
-        out[std::string(node_prefix) + ".c_ln"]       = std::string(cell_prefix) + "/pre_layer_norm_for_channel_mix/embedded_context.safetensors";
         out[std::string(node_prefix) + ".cmix"]       = std::string(cell_prefix) + "/channel_mixer/embedded_context.safetensors";
         out[std::string(node_prefix) + ".after_cmix"] = std::string(cell_prefix) + "/embedded_context_after_channel_mixer.safetensors";
     }
