@@ -1,66 +1,82 @@
 # Albatross
+
 efficient RWKV inference engine
 
-## Usage
+---
 
-Reference environment:
-- python 3.12.12
-- torch 2.8.0+cu130
+Fast inference: enter faster2_251201 and run benchmark.py (fastest decode) and demo3.py (fastest batch decode) and demo4.py (write 120 webpages in parallel).
 
-Then run the benchmark script:
-```
-python benchmark.py
-```
+Note: demo3.py has efficient standalone Python GUI and you can simply run it on your GPU computer.
 
-## 251201 Faster prefill via `cp.async`
-```
-CTX_LEN 256 : avg loss 1.7936 || prefill 9267 token/s = 128.47 TFLOPS
-CTX_LEN 512 : avg loss 1.6549 || prefill 10133 token/s = 140.47 TFLOPS
-CTX_LEN 1024 : avg loss 1.5689 || prefill 10750 token/s = 149.04 TFLOPS
-CTX_LEN 2048 : avg loss 1.5141 || prefill 10921 token/s = 151.4 TFLOPS
-CTX_LEN 4096 : avg loss 1.4825 || prefill 11289 token/s = 156.51 TFLOPS
-```
+While for demo2.py, you have to SSH to the GPU computer to run demo2.py in a SSH session, such that the GPU won't be affected by slow terminal rendering.
 
-## result @ 251127, CUDA FFN
-```
-Decode (with compile):
-Token/s = 123.53 (forward), 122.86 (full) || Bandwidth = 1712.55 GB/s || 4.1s
-Decode (compile + CUDAGraph):
-Token/s = 145.98 (forward), 145.25 (full) || Bandwidth = 2023.73 GB/s || 1.763s
-```
+---
 
-## result @ 251111, discrete state
+UPDATE: faster3_2605 can reach 17000+ tps prefill (B1T1024), 15000+ tps decode (B1024T1), 21000+ tps batch prefill (B32T32), on single 5090.
+
+UPDATE: faster3a_2605 is up to 40% faster than faster3_2605 for small B/T.
 ```
-Decode (with compile):
-Token/s = 122.81 (forward), 122.13 (full) || Bandwidth = 1702.55 GB/s || 9.072s
-Decode (compile + CUDAGraph):
-Token/s = 144.82 (forward), 144.05 (full) || Bandwidth = 2007.68 GB/s || 1.778s
+RESULT B=1 T=1 iters=3 p10_ms=6.9425 p50_ms=6.9427 p90_ms=7.1073 tok_s_p50=144.04
+RESULT B=1 T=2 iters=3 p10_ms=7.2224 p50_ms=7.2231 p90_ms=7.3045 tok_s_p50=276.89
+RESULT B=1 T=4 iters=3 p10_ms=7.8479 p50_ms=7.8638 p90_ms=8.0480 tok_s_p50=508.66
+RESULT B=1 T=8 iters=3 p10_ms=8.9945 p50_ms=8.9973 p90_ms=9.0790 tok_s_p50=889.15
+RESULT B=1 T=16 iters=3 p10_ms=9.2388 p50_ms=9.2642 p90_ms=9.3825 tok_s_p50=1727.09
+RESULT B=1 T=32 iters=3 p10_ms=11.1926 p50_ms=11.1940 p90_ms=11.4933 tok_s_p50=2858.66
+RESULT B=1 T=64 iters=3 p10_ms=11.6656 p50_ms=11.6670 p90_ms=11.9468 tok_s_p50=5485.54
+RESULT B=1 T=128 iters=3 p10_ms=13.4997 p50_ms=13.5012 p90_ms=13.6163 tok_s_p50=9480.67
+RESULT B=1 T=256 iters=3 p10_ms=18.2705 p50_ms=18.2778 p90_ms=18.3811 tok_s_p50=14006.07
+RESULT B=2 T=1 iters=3 p10_ms=7.2577 p50_ms=7.2684 p90_ms=7.3323 tok_s_p50=275.16
+RESULT B=4 T=1 iters=3 p10_ms=7.9306 p50_ms=7.9442 p90_ms=8.0348 tok_s_p50=503.51
+RESULT B=8 T=1 iters=3 p10_ms=8.7188 p50_ms=8.7593 p90_ms=8.9117 tok_s_p50=913.32
+RESULT B=16 T=1 iters=3 p10_ms=9.3525 p50_ms=9.3743 p90_ms=9.6280 tok_s_p50=1706.79
+RESULT B=32 T=1 iters=3 p10_ms=11.2196 p50_ms=11.2238 p90_ms=11.4337 tok_s_p50=2851.07
+RESULT B=64 T=1 iters=3 p10_ms=11.6686 p50_ms=11.6814 p90_ms=11.8833 tok_s_p50=5478.79
+RESULT B=128 T=1 iters=3 p10_ms=13.6054 p50_ms=13.6102 p90_ms=13.7000 tok_s_p50=9404.68
+RESULT B=256 T=1 iters=3 p10_ms=19.4996 p50_ms=19.5026 p90_ms=19.6272 tok_s_p50=13126.46
+RESULT B=2 T=2 iters=3 p10_ms=7.8615 p50_ms=7.8702 p90_ms=7.9935 tok_s_p50=508.25
+RESULT B=4 T=4 iters=3 p10_ms=9.1181 p50_ms=9.1330 p90_ms=9.2556 tok_s_p50=1751.89
+RESULT B=8 T=8 iters=3 p10_ms=11.0723 p50_ms=11.0758 p90_ms=11.2748 tok_s_p50=5778.38
+RESULT B=16 T=16 iters=3 p10_ms=14.8019 p50_ms=14.8049 p90_ms=14.8631 tok_s_p50=17291.61
 ```
+(for better performance, tune linear_orig_layout for your GPU)
 
+UPDATE: faster4_2605_cpp as standalone (no libtorch, no python) C++ inference (for better performance, tune linear_orig_layout_launch for your GPU)
 
-## Result @ 251105
-```
-Decode (with compile):
-Token/s = 118.82 (forward), 118.2 (full) || Bandwidth = 1647.26 GB/s || 9.493s
-Decode (compile + CUDAGraph):
-Token/s = 142.38 (forward), 141.74 (full) || Bandwidth = 1973.9 GB/s || 1.807s
-```
+---
 
-## Result @ 251102
+## Old Readme
 
-```
-Decode (with torch.jit):
-Token/s = 88.2 (forward), 87.85 (full) || Bandwidth = 1222.69 GB/s || 3.309s
-Decode (torch.jit + CUDAGraph):
-Token/s = 105.84 (forward), 104.57 (full) || Bandwidth = 1467.27 GB/s || 2.449s
+Please check this first: https://github.com/BlinkDL/Albatross/blob/main/benchmark.py
 
-Decode (with compile):
-Token/s = 109.4 (forward), 108.86 (full) || Bandwidth = 1516.67 GB/s || 5.451s
-Decode (compile + CUDAGraph):
-Token/s = 123.87 (forward), 123.36 (full) || Bandwidth = 1717.27 GB/s || 2.075s
-```
+Faster fwd & bwd CUDA kernels: https://github.com/BlinkDL/RWKV-CUDA/tree/main/rwkv7_fast_fused
 
+Full backend: https://github.com/RWKV-Vibe/rwkv_lightning
 
+Fast sampling: https://github.com/Triang-jyed-driung/Rapid-Sampling
+
+## Result @ 251201
+
+145+ token/s RWKV-7 7.2B fp16 bsz1 @ RTX5090
+
+11289 token/s RWKV-7 7.2B fp16 bsz1 prefill @ RTX5090
+
+Code: https://github.com/Triang-jyed-driung/Albatross/tree/fp16
+
+(enable torch.compile in https://github.com/Triang-jyed-driung/Albatross/blob/fp16/reference/rwkv7.py)
+
+## Result @ 251103
+
+10250+ token/s RWKV-7 7.2B fp16 bsz960 @ RTX5090
+
+9650+ token/s RWKV-7 7.2B fp16 bsz320 @ RTX5090
+
+123+ token/s RWKV-7 7.2B fp16 bsz1 @ RTX5090 with CUDAGraph and sparse FFN (lossless)
+
+Code: https://github.com/BlinkDL/Albatross/tree/main/faster_251101
+
+## Result @ 251007
+
+1.3x 7B decoding and 5x 0.1B decoding, with CUDAGraph.
 
 ## Result @ 250909
 
@@ -78,194 +94,4 @@ CTX_LEN 512 : avg loss 1.6548 || prefill 9163 token/s = 127.03 TFLOPS
 CTX_LEN 1024 : avg loss 1.5689 || prefill 9742 token/s = 135.06 TFLOPS
 CTX_LEN 2048 : avg loss 1.5141 || prefill 10081 token/s = 139.76 TFLOPS
 CTX_LEN 4096 : avg loss 1.4824 || prefill 10427 token/s = 144.55 TFLOPS
-```
-
-
-# Proposal for an FP16-Compatible State Evolution Kernel with Deterministic Dithering
-
-I propose a novel approach to implementing a state evolution entirely in **FP16**, leveraging **deterministic dithering**. The goal is to address the numerical challenges inherent in FP16 arithmetic while maintaining near-FP32 accuracy. Below, I detail the reasoning behind each numerical range and the motivations for my design choices.
-
----
-
-## 1. Reinterpreting the Decay Factor $w$
-
-Traditionally, $w$ is derived from $e^{-z}$. To improve numerical stability, I reinterpret it as:
-```math
-w' = e^{-z} - 1,
-```
-and update the state evolution equation accordingly:
-```diff
-- s = s * w[j] + k[j] * vv + sa * b[j];
-+ s += s * w[j] + k[j] * vv + sa * b[j];
-```
-
-This change leverages the **`expm1` function's higher accuracy** near $z \approx 0$.
-
-Further, I parameterize $w'$ as:
-```math
-w' = e^{-0.606531 \cdot \text{Sigmoid}(w)} - 1,
-```
-where $0.606531 \approx e^{-1/2}$. To optimize for hardware (PTX instruction `ex2.approx.ftz.f32`), I replace $e^x$ with $2^{x \cdot \log_2(e)}$ and fuse coefficients:
-```cpp
-constexpr float nexp_half_log2_e = -0.8750387749145276f; // == -exp(-1/2) * log2(e)
-```
-
----
-
-## 2. Deterministic Dithering Mechanism
-
-### 2.1 Design of the Rotator Function
-
-The rotator function is defined as:
-```cpp
-constexpr float two_to_neg_41 = 4.547473508864641e-13f; // == 2^(-41)
-constexpr int ro1 = (int)2654435769, ro2 = (int)1779033704, ro3 = (int)3144134277;
-#define rotator(_A,_B,_C) (two_to_neg_41*float(ro1*(_A)+ro2*(_B)+ro3*(_C)))
-```
-
-#### Key Properties of the Rotator:
-1. **Low-Discrepancy Sequences**:
-   - The coefficients $\text{ro1}, \text{ro2}, \text{ro3}$ are carefully chosen to produce low-discrepancy sequences.
-   - Specifically, $\text{ro1} = \lfloor 4294967296 \cdot \phi \rfloor$, where $\phi$ is the golden ratio ($\approx 1.618$).
-   - This ensures that `rotator(t, _, _)` produces sequences with discrepancy bounds of $\Theta(\frac{\log t}{t})$ (L. Kuipers and H. Niederreiter, Uniform distribution of sequences), superior to traditional pseudo-random numbers ( $\Theta(\frac{1}{\sqrt{t \log \log t}})$, law of iterated logarithm).
-
-2. **Range of Values**:
-   - $\text{ro1} \cdot A + \text{ro2} \cdot B + \text{ro3} \cdot C \in [-2^{31}, 2^{31}]$.
-   - $\texttt{rotator}(A, B, C) \in [-2^{-10}, 2^{-10}]$, equivalent to one or two ULP units of FP16 near 1 (the smallest number greater than 1 is $1.0009765625$).
-
-### 2.2 Dithering Around `exp2f(nexp_half_log2_e * w0) - 1`
-
-The final decay factor is computed as:
-```cpp
-exp2f(nexp_half_log2_e * w0) - 1 + rotator(t0+_t, i, (int)blockIdx.x)
-```
-
-- The term `exp2f(nexp_half_log2_e * w0) - 1` ensures $1 + w$ operates in range $[0.545, 1.0]$.
-- The dithering term $\text{rotator}(...)$ introduces a $\pm 2 \text{ULP}$ perturbation with a low-discrepancy pattern, breaking quantization bias.
-
----
-
-## 3. Performance Comparison
-
-### 3.1 Context Length vs Loss
-
-Performance comparison between FP16 and FP32 implementations is shown below:
-
-| Context Length | FP32 Avg Loss | FP16 Avg Loss | Difference |
-|----------------|---------------|---------------|------------|
-| 512            | 1.6549        | 1.6550        | +0.0001    |
-| 1024           | 1.5689        | 1.5689        | +0.0000    |
-| 2048           | 1.5142        | 1.5143        | +0.0001    |
-| 4096           | 1.4825        | 1.4826        | +0.0001    |
-
-### 3.2 Key Observations
-
-- The performance loss is minimal: approximately $7 \times 10^{-5}$.
-- This demonstrates that the proposed FP16 implementation achieves **near-FP32 accuracy** while significantly reducing memory and computation costs.
-
-
-# Result @ 251008
-Now over 10000 tokens/s on RTX5090 (bsz960). Special thanks to [@blealtan](https://github.com/blealtan) for implementing swizzling for coalesced state r/w. There is still plenty of room for optimization.
-
-# CUDA Functions for Sparse-Vector-Dense-Matrix Multiplication
-Now with a even faster kernel for Sparse-Vector-Dense-Matrix Multiplication. 
-
-> Mechanism: only rows `i` where `vector[i] != 0` are being read. This reduces down global memory access significantly.
-
-Estimated around 18us on dimension 16384x4096, this kernel outperforms naive matrix-vector multiplication.
-
-We sincerely thank [FlagOpen/FlagGems](https://github.com/FlagOpen/FlagGems) for first implementing this idea, and [tile-ai/tilelang](https://github.com/tile-ai/tilelang) for code templates for asynchronous copy operations.
-
-```cpp
-#define BLOCKDIM 128
-#define MAXNPERBLOCK 64
-__global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
-    const int C,
-    const half* __restrict__ vec,
-    const half* __restrict__ mat,
-    half* __restrict__ out
-){
-    __shared__ __align__(256) half mat_row_smem[2][2*BLOCKDIM];
-    __shared__ __align__(256) half vec_slice[MAXNPERBLOCK];
-    __shared__ __align__(256) int nnz_ids[MAXNPERBLOCK];
-    __shared__ int nnz_count;
-    const int bx = blockIdx.x;
-    const int by = blockIdx.y;
-    const int t = threadIdx.x;
-    const int start_pos = bx * MAXNPERBLOCK;
-
-    if (t < 32){
-        *(half2*)(vec_slice + t*2) = *(const half2*)(vec + start_pos + t*2);
-    }
-    __syncthreads();
-    if (t == 0){
-        int cnt = 0;
-        #pragma unroll
-        for (int i=0; i<8; ++i) {
-            common128 z;
-            z.I = ((const int4*)vec_slice)[i];
-            #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                unsigned short bits = __half_as_ushort(z.h[j]);
-                if (bits != 0x0000 && bits != 0x8000) {
-                    int idx = i * 8 + j;
-                    nnz_ids[cnt] = idx;
-                    cnt++;
-                }
-            }
-        }
-        nnz_count = cnt;
-    }
-    __syncthreads();
-
-    half2 out_frag;
-    *(int*)(&out_frag) = 0;
-    // init
-    #pragma unroll
-    for(int i = 0; i < 2; i++){
-        if (i < nnz_count){
-            int actual_pos = start_pos + nnz_ids[i];
-            cp_async_gs_conditional<4>(mat_row_smem[i%2] + t*2, mat + actual_pos * C + by * (2*BLOCKDIM) + t*2, true);
-            cp_async_commit();
-        }
-    }
-    // main for
-    for(int i = 0; i < nnz_count-2; i++){
-        // take data
-        cp_async_wait<1>();
-        __syncthreads();
-
-        half2 mat_row_frag = *(half2*) (mat_row_smem[i%2] + t*2);
-        half vec_value = vec_slice[nnz_ids[i]];
-
-        // store
-        int actual_pos = start_pos + nnz_ids[i+2];
-        cp_async_gs_conditional<4>(mat_row_smem[i%2] + t*2, mat + actual_pos * C + by * (2*BLOCKDIM) + t*2, true);
-        cp_async_commit();
-
-        // compute
-        out_frag = __hfma2(__half2half2(vec_value), mat_row_frag, out_frag);
-    }
-
-    // end
-    if (nnz_count >= 2){
-        cp_async_wait<1>();
-        __syncthreads();
-
-        half2 mat_row_frag = *(half2*) (mat_row_smem[nnz_count%2] + t*2);
-        half vec_value = vec_slice[nnz_ids[nnz_count - 2]];
-
-        out_frag = __hfma2(__half2half2(vec_value), mat_row_frag, out_frag);
-    }
-    if (nnz_count >= 1){
-        cp_async_wait<0>();
-        __syncthreads();
-
-        half2 mat_row_frag = *(half2*) (mat_row_smem[(nnz_count+1)%2] + t*2);
-        half vec_value = vec_slice[nnz_ids[nnz_count - 1]];
-
-        out_frag = __hfma2(__half2half2(vec_value), mat_row_frag, out_frag);
-    }
-    atomicAdd((half2*)(out + by*(2*BLOCKDIM) + t*2), out_frag);
-}
 ```
