@@ -19,12 +19,23 @@ safetensors 序列化或文件写入算进去；更不要把整段 prefill / tra
 
 只要为某个模块写了 timing，就必须保证该模块的 `elapsed_ns` 来自正确的 compute
 边界和必要的设备同步。不会正确计时就不要写成 `0` 冒充有效 trace；该后端必须修正计时
-实现，或把对应模块标记为 unsupported 并拒绝产出 timing 结果。
+实现，或拒绝产出该 timing 结果。
+
+推理后端的 timing 只能使用真实运行中已经存在的同步点、scheduler observed node、hook
+完成点，或后端原生 timed submission 结果。不要为了“补齐导出集合”在非同步点强制
+`cuda.synchronize()` / readback / blocking copy；这种插桩会把原本可异步排队的 kernel
+切碎，测到的是插桩后的执行形态，不是后端真实速度。
+
+训练和推理的导出集合只按 `docs/trace-contract.md` 的文件树执行：训练树保留训练真实边界；
+推理 compare 树只保留各推理后端共同同步边界。若后端 X 把相邻模块 A+B 合并执行，而后端 Y
+没有合并，则推理树统一选择 A 前和 B 后，A/B 中间点只在训练树里标注“推理已融合，跳过”。
+compare 输出里不应出现融合/跳过状态；出现 missing / extra 文件说明插桩集合没有对齐，应回到
+文件树边界修正。
 
 `elapsed_ns` 必须写 warmup 后的平均耗时，不允许写冷启动单次耗时或总耗时。平均口径是
-同一个真实程序入口、同一输入、同一模型、同一设备同步边界下，在 `trace()` helper 内
-先执行 `warmup` 次被测 callable 且不计入样本，再执行 `repeat` 次被测 callable 并对
-这些原始样本做算术平均：
+同一个真实程序入口、同一输入、同一模型、同一设备同步边界下，先执行 `warmup`
+次真实 train step / prefill 且不计入样本，再执行 `repeat` 次等价真实 run 并对这些原始样本
+做算术平均：
 
 ```text
 elapsed_ns = round(sum(samples_ns) / repeat)
@@ -38,6 +49,12 @@ elapsed_ns = round(sum(samples_ns) / repeat)
 - `repeat`：参与平均的有效 trace run 数。
 - `warmup`：未参与平均的预热 trace run 数。
 - `samples_ns`：参与平均的每次完整 trace run 原始样本。
+
+trace helper 不能为了 repeat 在同一个真实 forward 中重复调用会修改 state、推进 token
+position、写 KV/RNN state、采样状态或其它可变后端状态的 callable。此类 timing 必须由真实
+入口重复运行、后端已有 benchmark 机制、一次真实 graph segment timing、或每次 repeat 都重新
+构造等价输入和 state 的隔离 microbench 产生。否则 trace 会污染计算图/状态，正确性和速度都
+不能信。
 
 多输出模块只能写一个模块 timing。例如 `loss/l2wrap_cross_entropy` 同时导出 loss、lse、
 max_vals、argmax 等激活值时，只写 `timing/loss/l2wrap_cross_entropy.time.json`，
@@ -68,8 +85,9 @@ duplicate 判断之后。
 C++ helper 也使用 `TraceWriter` 维护已保存 tensor key。ggml / libtorch 都能构造 runtime
 identity，不需要读回 tensor 内容；但 libtorch 没有统一暴露 Python `_version` 等价物，
 已登记 tensor 不应再被 in-place 改写，或由调用点扩展 key 加显式 generation。libtorch
-调用点传入被测 lambda、`outputs(out<0>("..."))` 和需要同步的输入 tensor，
-`trace_libtorch` 在内部完成同步、计时、执行、输出保存和模块 timing 写入。
+调用点传入被测 lambda、`outputs(out<0>("..."))` 和需要同步的输入 tensor。
+`trace_libtorch` 只能用于不会污染 state 的边界，或由调用方保证每次 repeat 都使用隔离
+state；否则只能保存激活，不能在 helper 内 repeat 计时。
 
 llama.cpp 的 `cb_eval` 只能在 scheduler 观察到某个 graph tensor 时回调。用于逐模块耗时
 对比时，计时必须夹在命中 observed node 的 `ask=true` 和对应 `ask=false` 之间，也就是
@@ -141,6 +159,9 @@ trace 可以显式设为 `RWKV_TRACE_WARMUP=0 RWKV_TRACE_REPEAT=1`，但不能�
   `web_rwkv` trace 必须在 Windows WebGPU 环境运行；WSL 里即使 CUDA / `nvidia-smi` 可用，
   `wgpu` 也可能只能枚举到 llvmpipe CPU adapter，不能作为正式 `web_rwkv` 导出环境。
 - llama.cpp / rwkv-mobile：通过真实 `llama_decode` / backend eval prefill 路径导出 graph tensor；第一个 prefill 完成后退出，不继续采样生成。
+- 推理后端只导出同步点交集上的速度数据。`llama.cpp` 的 `cb_eval` observed node、
+  `web-rwkv` 的 hook/timed submission、CUDA 后端的真实 kernel 边界可以作为 timing 来源；
+  Python 层临时变量、residual add、pre-LN 等非同步点不能为了对齐文件集合而新增 timing。
 - prompt 统一设为：
 
 ```text

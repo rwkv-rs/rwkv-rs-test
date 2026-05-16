@@ -20,7 +20,7 @@ head+CE 路径时的 `loss/head_l2wrap_cross_entropy.safetensors`。如果一个
 elapsed_ns = round(sum(samples_ns) / repeat)
 ```
 
-`repeat`：参与平均的有效 module callable 样本数。平均导出使用真实入口：
+`repeat`：参与平均的有效真实 run 样本数。平均导出使用真实入口：
 
 ```bash
 RWKV_TRACE_WARMUP=1 RWKV_TRACE_REPEAT=3 bash trace-train.sh

@@ -23,7 +23,6 @@ _SAVED_BY_FILENAME: dict[str, TensorKey] = {}
 _LAST_SAMPLES_NS: list[int] = []
 _CANONICAL_CELL_RE = re.compile(
     r"^cells/cell_\d{4}/("
-    r"time_mixer/value_from_first_cell|"
     r"time_mixer/embedded_context|"
     r"embedded_context_after_time_mixer|"
     r"channel_mixer/embedded_context|"
@@ -34,6 +33,7 @@ _CANONICAL_SINGLETONS = {
     "embedding/token_ids.safetensors",
     "embedding/embedded_context.safetensors",
     "layer_norm0/embedded_context.safetensors",
+    "cells/cell_0000/time_mixer/value_from_first_cell.safetensors",
     "lm_head/embedded_context.safetensors",
     "lm_head/logits.safetensors",
     "loss/l2wrap_cross_entropy.safetensors",

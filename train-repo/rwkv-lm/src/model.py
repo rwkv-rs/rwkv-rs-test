@@ -728,16 +728,18 @@ class Block(nn.Module):
 
         def time_mixer_forward():
             x_attn, next_v_first = self.att(x_tmix, v_first)
-            value_trace = next_v_first if self.layer_id == 0 else next_v_first.contiguous().clone()
-            return x_attn, next_v_first, value_trace
+            return x_attn, next_v_first
 
-        x_attn, v_first, _ = trace(
+        time_mixer_outputs = {
+            0: f"cells/cell_{self.layer_id:04d}/time_mixer/embedded_context.safetensors",
+        }
+        if self.layer_id == 0:
+            time_mixer_outputs[1] = "cells/cell_0000/time_mixer/value_from_first_cell.safetensors"
+
+        x_attn, v_first = trace(
             f"cells/cell_{self.layer_id:04d}/time_mixer",
             time_mixer_forward,
-            outputs={
-                0: f"cells/cell_{self.layer_id:04d}/time_mixer/embedded_context.safetensors",
-                2: f"cells/cell_{self.layer_id:04d}/time_mixer/value_from_first_cell.safetensors",
-            },
+            outputs=time_mixer_outputs,
         )
 
         x = trace(

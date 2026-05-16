@@ -183,7 +183,7 @@ def trace(
         _sync_tensors(result)
         samples_ns.append(perf_counter_ns() - start)
 
-    elapsed_ns = round(sum(samples_ns) / len(samples_ns))
+    elapsed_ns = (2 * sum(samples_ns) + len(samples_ns)) // (2 * len(samples_ns))
     global _LAST_SAMPLES_NS
     _LAST_SAMPLES_NS = samples_ns
     _write_outputs(outputs, result)

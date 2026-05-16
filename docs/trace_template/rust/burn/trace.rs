@@ -83,14 +83,13 @@ fn canonical_cell_path(filename: &str) -> bool {
     };
     cell.len() == 4
         && cell.bytes().all(|b| b.is_ascii_digit())
-        && matches!(
+        && (matches!(
             name,
-            "time_mixer/value_from_first_cell.safetensors"
-                | "time_mixer/embedded_context.safetensors"
+            "time_mixer/embedded_context.safetensors"
                 | "embedded_context_after_time_mixer.safetensors"
                 | "channel_mixer/embedded_context.safetensors"
                 | "embedded_context_after_channel_mixer.safetensors"
-        )
+        ) || (cell == "0000" && name == "time_mixer/value_from_first_cell.safetensors"))
 }
 
 fn tensor_name(filename: &str) -> String {
