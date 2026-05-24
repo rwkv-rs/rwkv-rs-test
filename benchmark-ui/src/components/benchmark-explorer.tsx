@@ -1,17 +1,24 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { Activity, BarChart3, Database, Gauge, RefreshCcw, Trophy } from "lucide-react";
-import type { BenchmarkRow, MetricKey, Task5Dataset } from "@/lib/types";
-import { computeRaceSummary, displayModelName, filterRows, formatTimestamp, makeSeries, normalizedStatus, seriesNameForRow, uniqueSorted } from "@/lib/analytics";
+import { AlertTriangle, BarChart3, CheckCircle2, Database, Gauge, RefreshCcw, Trophy } from "lucide-react";
+import type { BenchmarkRow, BenchmarkTask, MetricKey, Task5Dataset } from "@/lib/types";
+import { computeRaceSummary, displayModelName, filterRows, formatTimestamp, makeSeries, normalizedStatus, seriesNameForRow, taskAxisDescription, uniqueSorted } from "@/lib/analytics";
 import { ThroughputChart } from "./throughput-chart";
 
 type Mode = "backend" | "model";
 type GroupBy = "model" | "backend";
 
 const METRICS: { key: MetricKey; label: string }[] = [
-  { key: "decodeTps", label: "Decode TPS" },
-  { key: "prefillTps", label: "Prefill TPS" }
+  { key: "forwardSampleTps", label: "Forward+Sample TPS" },
+  { key: "p50Ms", label: "p50 ms" }
+];
+
+const TASKS: { key: BenchmarkTask; label: string }[] = [
+  { key: "decode", label: "Decode" },
+  { key: "prefill", label: "Prefill" },
+  { key: "batch_decode", label: "Batch Decode" },
+  { key: "batch_prefill", label: "Batch Prefill" }
 ];
 
 export function BenchmarkExplorer({ dataset }: { dataset: Task5Dataset | null }) {
@@ -19,25 +26,19 @@ export function BenchmarkExplorer({ dataset }: { dataset: Task5Dataset | null })
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isLoadingStatic, setIsLoadingStatic] = useState(!dataset);
   const [mode, setMode] = useState<Mode>("backend");
-  const [metric, setMetric] = useState<MetricKey>("decodeTps");
+  const [metric, setMetric] = useState<MetricKey>("forwardSampleTps");
+  const [task, setTask] = useState<BenchmarkTask>("decode");
   const [modelId, setModelId] = useState(() => chooseDefaultModel(data.rows));
   const [paramGroup, setParamGroup] = useState(() => data.groups[0]?.id ?? "");
-  const [promptLen, setPromptLen] = useState("");
   const [quantization, setQuantization] = useState("");
   const [repo, setRepo] = useState("");
+  const [backend, setBackend] = useState("");
   const [status, setStatus] = useState("");
   const [groupBy, setGroupBy] = useState<GroupBy>("model");
   const [selectedName, setSelectedName] = useState<string | null>(null);
 
   const options = useMemo(() => buildOptions(data.rows), [data.rows]);
-  const promptLenFilter = promptLen ? Number(promptLen) : undefined;
-  const contextOptions = useMemo(() => {
-    const contextValues = options.promptLens.map((value) => ({ value: String(value), label: String(value) }));
-    if (metric === "decodeTps") {
-      return [{ value: "", label: "all contexts (median)" }, ...contextValues];
-    }
-    return contextValues;
-  }, [metric, options.promptLens]);
+  const globalStatus = useMemo(() => countStatuses(data.rows), [data.rows]);
 
   useEffect(() => {
     if (dataset) {
@@ -75,24 +76,19 @@ export function BenchmarkExplorer({ dataset }: { dataset: Task5Dataset | null })
     };
   }, [dataset]);
 
-  useEffect(() => {
-    if (metric === "prefillTps" && !promptLen) {
-      setPromptLen(String(defaultPromptLen(options.promptLens)));
-    }
-  }, [metric, options.promptLens, promptLen]);
-
   const activeRows = useMemo(() => {
     return filterRows(data.rows, {
       metric,
       mode,
       modelId: mode === "backend" ? modelId : undefined,
       paramGroup: mode === "model" ? paramGroup : undefined,
-      promptLen: promptLenFilter,
+      task,
       quantization: quantization || undefined,
       repo: repo || undefined,
+      backend: backend || undefined,
       status: status || undefined
     });
-  }, [data.rows, metric, mode, modelId, paramGroup, promptLenFilter, quantization, repo, status]);
+  }, [data.rows, metric, mode, modelId, paramGroup, task, quantization, repo, backend, status]);
 
   const series = useMemo(() => {
     if (mode === "backend") {
@@ -129,12 +125,14 @@ export function BenchmarkExplorer({ dataset }: { dataset: Task5Dataset | null })
       <header className="topbar">
         <div>
           <div className="eyebrow">RWKV TASK 5</div>
-          <h1>Benchmark Explorer</h1>
+          <h1>Core Throughput</h1>
+          <p className="topbarNote">Forward+sample rows from the DevPod 2 core benchmark matrix.</p>
         </div>
         <div className="topbarStats">
           <Stat icon={<Database size={16} />} label="Rows" value={data.rows.length.toLocaleString()} />
-          <Stat icon={<BarChart3 size={16} />} label="Groups" value={data.groups.length.toLocaleString()} />
-          <Stat icon={<Activity size={16} />} label="Kind" value="synthetic throughput" />
+          <Stat icon={<CheckCircle2 size={16} />} label="OK" value={globalStatus.ok.toLocaleString()} />
+          <Stat icon={<AlertTriangle size={16} />} label="Failed" value={globalStatus.failed.toLocaleString()} />
+          <Stat icon={<BarChart3 size={16} />} label="Unsupported" value={globalStatus.unsupported.toLocaleString()} />
           <Stat icon={<RefreshCcw size={16} />} label="Updated" value={formatTimestamp(data.generatedAt)} />
         </div>
       </header>
@@ -150,11 +148,6 @@ export function BenchmarkExplorer({ dataset }: { dataset: Task5Dataset | null })
           {METRICS.map((item) => (
             <button key={item.key} className={metric === item.key ? "active" : ""} onClick={() => {
               setMetric(item.key);
-              if (item.key === "decodeTps") {
-                setPromptLen("");
-              } else if (!promptLen) {
-                setPromptLen(String(defaultPromptLen(options.promptLens)));
-              }
             }}>
               {item.label}
             </button>
@@ -170,9 +163,10 @@ export function BenchmarkExplorer({ dataset }: { dataset: Task5Dataset | null })
           ) : (
             <Select label="Param group" value={paramGroup} onChange={setParamGroup} options={data.groups.map((group) => ({ value: group.id, label: group.label }))} />
           )}
-          <Select label="Context" value={promptLen} onChange={setPromptLen} options={contextOptions} />
+          <TaskSegmented value={task} onChange={setTask} />
           <Select label="Quant" value={quantization} onChange={setQuantization} options={[{ value: "", label: "all" }, ...options.quantizations]} />
-          <Select label="Backend" value={repo} onChange={setRepo} options={[{ value: "", label: "all" }, ...options.repos]} />
+          <Select label="Repo" value={repo} onChange={setRepo} options={[{ value: "", label: "all" }, ...options.repos]} />
+          <Select label="Implementation" value={backend} onChange={setBackend} options={[{ value: "", label: "all" }, ...options.backends]} />
           <Select label="Status" value={status} onChange={setStatus} options={[{ value: "", label: "all" }, ...options.statuses]} />
           {mode === "model" ? (
             <Select label="Group by" value={groupBy} onChange={(value) => setGroupBy(value as GroupBy)} options={[{ value: "model", label: "model" }, { value: "backend", label: "backend" }]} />
@@ -184,7 +178,7 @@ export function BenchmarkExplorer({ dataset }: { dataset: Task5Dataset | null })
             <div>
               <div className="eyebrow">{mode === "backend" ? "Same model backend comparison" : "Similar-size model comparison"}</div>
               <h2>{mode === "backend" ? displayModelName(modelId) : paramGroup}</h2>
-              <p className="metricNote">{metric === "decodeTps" && !promptLen ? "Decode TPS is aggregated as the median across all contexts." : "Prefill TPS is shown for the selected context length."}</p>
+              <p className="metricNote">{taskAxisDescription(task)}</p>
             </div>
             <button className="quietButton" onClick={refreshData} disabled={isRefreshing}>
               <RefreshCcw size={15} />
@@ -194,6 +188,7 @@ export function BenchmarkExplorer({ dataset }: { dataset: Task5Dataset | null })
           {isLoadingStatic ? <div className="loadingPanel">Loading cached Task 5 dataset...</div> : null}
           <ThroughputChart
             metric={metric}
+            task={task}
             series={series}
             selectedName={selectedName}
             onSelectName={setSelectedName}
@@ -239,13 +234,16 @@ export function BenchmarkExplorer({ dataset }: { dataset: Task5Dataset | null })
             <thead>
               <tr>
                 <th>Model</th>
+                <th>Repo</th>
                 <th>Backend</th>
+                <th>Task</th>
+                <th>B</th>
+                <th>T</th>
                 <th>Quant</th>
-                <th>bsz</th>
-                <th>ctx</th>
                 <th>Status</th>
-                <th>Decode</th>
-                <th>Prefill</th>
+                <th>Forward+Sample</th>
+                <th>p50 ms</th>
+                <th>Entrypoint</th>
                 <th>Source</th>
                 <th>Error</th>
               </tr>
@@ -255,12 +253,15 @@ export function BenchmarkExplorer({ dataset }: { dataset: Task5Dataset | null })
                 <tr key={row.id}>
                   <td>{displayModelName(row.modelId, row.modelLabel)}</td>
                   <td>{row.repo}</td>
+                  <td>{row.backend}</td>
+                  <td>{row.task}</td>
+                  <td>{row.B}</td>
+                  <td>{row.T}</td>
                   <td>{row.quantization || row.dtype || "-"}</td>
-                  <td>{row.bsz}</td>
-                  <td>{row.promptLen}</td>
                   <td><span className={`status ${normalizedStatus(row.status)}`}>{normalizedStatus(row.status)}</span></td>
-                  <td>{formatMetric(row.decodeTps)}</td>
-                  <td>{formatMetric(row.prefillTps)}</td>
+                  <td>{formatMetric(row.forwardSampleTps)}</td>
+                  <td>{formatMetric(row.p50Ms)}</td>
+                  <td>{row.entrypoint || "-"}</td>
                   <td><code>{row.sourcePath}</code></td>
                   <td className="errorCell">{row.error}</td>
                 </tr>
@@ -302,36 +303,92 @@ function Select({ label, value, options, onChange }: { label: string; value: str
   );
 }
 
+function TaskSegmented({ value, onChange }: { value: BenchmarkTask; onChange: (value: BenchmarkTask) => void }) {
+  return (
+    <div className="field">
+      <span>Task</span>
+      <div className="taskTabs" role="tablist" aria-label="Task">
+        {TASKS.map((item) => (
+          <button
+            key={item.key}
+            type="button"
+            role="tab"
+            aria-selected={value === item.key}
+            className={value === item.key ? "active" : ""}
+            onClick={() => onChange(item.key)}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function StatusBlock({ label, value }: { label: string; value: number }) {
   return <div className={`statusBlock ${label}`}><span>{label}</span><strong>{value}</strong></div>;
+}
+
+function countStatuses(rows: BenchmarkRow[]) {
+  return rows.reduce(
+    (counts, row) => {
+      if (row.status === "ok") {
+        counts.ok += 1;
+      } else if (row.status === "unsupported") {
+        counts.unsupported += 1;
+      } else {
+        counts.failed += 1;
+      }
+      return counts;
+    },
+    { ok: 0, failed: 0, unsupported: 0 }
+  );
 }
 
 function buildOptions(rows: BenchmarkRow[]) {
   return {
     models: uniqueSorted(rows.map((row) => row.modelId)).map((model) => ({ value: model, label: displayModelName(model) })),
-    promptLens: uniqueSorted(rows.map((row) => row.promptLen), Number),
     quantizations: uniqueSorted(rows.map((row) => row.quantization).filter(Boolean)).map((value) => ({ value, label: value })),
     repos: uniqueSorted(rows.map((row) => row.repo)).map((value) => ({ value, label: value })),
+    backends: uniqueSorted(rows.map((row) => row.backend)).map((value) => ({ value, label: value })),
     statuses: uniqueSorted(rows.map((row) => normalizedStatus(row.status))).map((value) => ({ value, label: value }))
   };
 }
 
 function chooseDefaultModel(rows: BenchmarkRow[]): string {
-  const counts = new Map<string, number>();
+  const albatrossBackendsByModel = new Map<string, Set<string>>();
+  const backendsByModel = new Map<string, Set<string>>();
+  const okRowsByModel = new Map<string, number>();
   for (const row of rows) {
-    if (row.status === "ok" && row.modelSize === "1.5B") {
-      counts.set(row.modelId, (counts.get(row.modelId) ?? 0) + 1);
+    if (row.status === "ok" || row.status === "failed" || row.status === "unsupported") {
+      const backends = backendsByModel.get(row.modelId) ?? new Set<string>();
+      backends.add(row.backend);
+      backendsByModel.set(row.modelId, backends);
+      if (row.repo === "albatross") {
+        const albatrossBackends = albatrossBackendsByModel.get(row.modelId) ?? new Set<string>();
+        albatrossBackends.add(row.backend);
+        albatrossBackendsByModel.set(row.modelId, albatrossBackends);
+      }
+    }
+    if (row.status === "ok") {
+      okRowsByModel.set(row.modelId, (okRowsByModel.get(row.modelId) ?? 0) + 1);
     }
   }
-  return Array.from(counts.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] ?? rows[0]?.modelId ?? "";
-}
-
-function defaultPromptLen(promptLens: number[]): number {
-  return promptLens.includes(1024) ? 1024 : promptLens[0] ?? 1024;
+  return Array.from(backendsByModel.entries())
+    .sort(
+      (a, b) =>
+        (albatrossBackendsByModel.get(b[0])?.size ?? 0) - (albatrossBackendsByModel.get(a[0])?.size ?? 0) ||
+        b[1].size - a[1].size ||
+        (okRowsByModel.get(b[0]) ?? 0) - (okRowsByModel.get(a[0]) ?? 0) ||
+        a[0].localeCompare(b[0], undefined, { numeric: true })
+    )[0]?.[0] ?? rows[0]?.modelId ?? "";
 }
 
 function sortRows(rows: BenchmarkRow[], metric: MetricKey): BenchmarkRow[] {
-  return [...rows].sort((a, b) => (b[metric] ?? -1) - (a[metric] ?? -1) || a.repo.localeCompare(b.repo));
+  if (metric === "p50Ms") {
+    return [...rows].sort((a, b) => (a[metric] ?? Number.POSITIVE_INFINITY) - (b[metric] ?? Number.POSITIVE_INFINITY) || a.backend.localeCompare(b.backend));
+  }
+  return [...rows].sort((a, b) => (b[metric] ?? -1) - (a[metric] ?? -1) || a.backend.localeCompare(b.backend));
 }
 
 function fastestLabel(row: BenchmarkRow, rows: BenchmarkRow[], mode: Mode, groupBy: GroupBy): string {

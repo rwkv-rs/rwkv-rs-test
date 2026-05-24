@@ -75,6 +75,7 @@ class RwkvLmStaticContractTests(unittest.TestCase):
         self.assertIn('trace("embedding"', model)
         self.assertIn('f"cells/cell_{self.layer_id:04d}/time_mixer"', model)
         self.assertIn('f"cells/cell_{self.layer_id:04d}/channel_mixer"', model)
+        self.assertIn('trace("lm_head/projection", lambda: self.head(x))', model)
         self.assertIn('"loss/l2wrap_cross_entropy"', model)
         self.assertIn('"loss/head_l2wrap_cross_entropy"', model)
         self.assertNotIn("trace(\"lm_head/logits.safetensors\"", model)

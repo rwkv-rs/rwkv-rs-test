@@ -81,6 +81,9 @@ target_link_libraries(simple_benchmark PUBLIC rwkv_mobile_internal)
 add_executable(batch_benchmark batch_benchmark.cpp)
 target_link_libraries(batch_benchmark PUBLIC rwkv_mobile_internal)
 
+add_executable(task5_core_forward_sample task5_core_forward_sample.cpp)
+target_link_libraries(task5_core_forward_sample PUBLIC rwkv_mobile_internal)
+
 if (ENABLE_TTS)
     add_executable(test_tts test_tts.cpp)
     target_link_libraries(test_tts PUBLIC rwkv_mobile_internal)

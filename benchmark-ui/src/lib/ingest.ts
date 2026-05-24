@@ -23,12 +23,13 @@ export function parseTask5Csv(content: string): RawRow[] {
 
 export function normalizeTask5Rows(rows: RawRow[], sourcePath: string): BenchmarkRow[] {
   return rows
-    .filter((row) => row.benchmark_kind === "synthetic_throughput")
+    .filter((row) => row.benchmark_kind === "core_forward_sample_throughput")
     .map((row, index) => {
       const modelSize = row.model_size || inferModelSize(row.model_path) || "unknown";
       const modelSizeB = parseModelSizeB(modelSize);
       const modelId = inferModelId(row.model_path, modelSize, row.repo);
-      const status = row.status || "unknown";
+      const normalized = normalizeTask5Contract(row);
+      const status = normalized.status;
       return {
         id: `${sourcePath}:${row.run_id || "row"}:${index}`,
         benchmarkKind: row.benchmark_kind,
@@ -40,22 +41,54 @@ export function normalizeTask5Rows(rows: RawRow[], sourcePath: string): Benchmar
         repo: row.repo || "unknown",
         backend: row.backend || row.repo || "unknown",
         runner: row.runner || "",
+        task: row.task || "unknown",
         dtype: row.dtype || "",
         quantization: row.quantization || "",
-        bsz: intOrZero(row.bsz),
-        promptLen: intOrZero(row.prompt_len),
-        decodeLen: intOrZero(row.decode_len),
+        B: intOrZero(row.B),
+        T: intOrZero(row.T),
         status,
-        error: row.error || "",
-        prefillTps: metricOrNull(row.prefill_tps, status),
-        decodeTps: metricOrNull(row.decode_tps, status),
-        e2eTps: metricOrNull(row.e2e_tps, status),
+        error: normalized.error,
+        inputTokens: intOrZero(row.input_tokens),
+        measuredTokens: intOrZero(row.measured_tokens),
+        totalTimeS: metricOrNull(row.total_time_s, status),
+        forwardTimeS: metricOrNull(row.forward_time_s, status),
+        sampleTimeS: metricOrNull(row.sample_time_s, status),
+        p50Ms: metricOrNull(row.p50_ms, status),
+        forwardSampleTps: metricOrNull(row.forward_sample_tps, status),
+        entrypoint: row.entrypoint || "",
+        measurementBoundary: row.measurement_boundary || "",
         gpuName: row.gpu_name || "",
         gpuUuid: row.gpu_uuid || "",
+        startedAt: row.started_at || "",
+        endedAt: row.ended_at || "",
         sourcePath,
         command: row.command || ""
       };
     });
+}
+
+function normalizeTask5Contract(row: RawRow): { status: string; error: string } {
+  const status = row.status || "unknown";
+  const backend = row.backend || row.repo || "";
+  if (
+    row.repo === "albatross"
+    && row.task === "batch_prefill"
+    && isLegacyAlbatrossBatchPrefillBackend(backend)
+  ) {
+    return {
+      status: "unsupported",
+      error: `${backend} forward_batch(list[list[int]]) is not task-native BnTn batch prefill`
+    };
+  }
+  return { status, error: row.error || "" };
+}
+
+function isLegacyAlbatrossBatchPrefillBackend(backend: string): boolean {
+  return (
+    backend === "albatross-_ref_slower_"
+    || backend === "albatross-faster_251101"
+    || backend === "albatross-faster2_251201"
+  );
 }
 
 export function buildModelGroups(rows: BenchmarkRow[], config?: ModelGroupConfig): { rows: BenchmarkRow[]; groups: ModelGroup[] } {
@@ -94,7 +127,7 @@ export function buildModelGroups(rows: BenchmarkRow[], config?: ModelGroupConfig
 }
 
 export function buildDataset(rows: BenchmarkRow[], sourceRoot: string, config?: ModelGroupConfig): Task5Dataset {
-  const grouped = buildModelGroups(rows, config);
+  const grouped = buildModelGroups(dedupeBenchmarkRows(rows), config);
   return {
     generatedAt: new Date().toISOString(),
     sourceRoot,
@@ -102,6 +135,63 @@ export function buildDataset(rows: BenchmarkRow[], sourceRoot: string, config?: 
     rows: grouped.rows,
     groups: grouped.groups
   };
+}
+
+export function dedupeBenchmarkRows(rows: BenchmarkRow[]): BenchmarkRow[] {
+  const byKey = new Map<string, BenchmarkRow>();
+  for (const row of rows) {
+    const key = dedupeKey(row);
+    const current = byKey.get(key);
+    if (!current || isPreferredDuplicate(row, current)) {
+      byKey.set(key, row);
+    }
+  }
+  return rows.filter((row) => byKey.get(dedupeKey(row)) === row);
+}
+
+function dedupeKey(row: BenchmarkRow): string {
+  return [
+    row.benchmarkKind,
+    row.modelId,
+    row.repo,
+    row.backend,
+    row.task,
+    row.B,
+    row.T,
+    row.quantization || row.dtype || ""
+  ].join("\x1f");
+}
+
+function isPreferredDuplicate(next: BenchmarkRow, current: BenchmarkRow): boolean {
+  const nextTime = rowTimeMs(next);
+  const currentTime = rowTimeMs(current);
+  if (nextTime !== null || currentTime !== null) {
+    const timeDelta = (nextTime ?? -1) - (currentTime ?? -1);
+    if (timeDelta !== 0) {
+      return timeDelta > 0;
+    }
+  }
+  const statusDelta = statusRank(next.status) - statusRank(current.status);
+  if (statusDelta !== 0) {
+    return statusDelta > 0;
+  }
+  return next.sourcePath.localeCompare(current.sourcePath, undefined, { numeric: true }) > 0;
+}
+
+function rowTimeMs(row: BenchmarkRow): number | null {
+  const value = row.endedAt || row.startedAt || "";
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function statusRank(status: string): number {
+  if (status === "ok") {
+    return 3;
+  }
+  if (status === "failed" || status === "unsupported") {
+    return 2;
+  }
+  return 1;
 }
 
 export function parseModelSizeB(value: string): number | null {

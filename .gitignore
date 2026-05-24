@@ -3,9 +3,12 @@
 /data
 /weights
 /test_gen
+/test_gen_*
 /train-repo/rwkv-peft/out_trace
+/infer-repo/albatross/faster4_2605_cpp/bin/
 /infer-repo/nano-vllm/results
 /infer-repo/llama.cpp/results
+/benchmark-ui/public/data/*.json
 /results
 /.trace_tmp
 __pycache__/

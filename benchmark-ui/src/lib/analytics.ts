@@ -1,4 +1,4 @@
-import type { BenchmarkRow, ChartSeries, MetricKey, RaceSummary, StatusPoint } from "./types";
+import type { BenchmarkRow, BenchmarkTask, ChartSeries, MetricKey, RaceSummary, StatusPoint } from "./types";
 
 export function metricValue(row: BenchmarkRow, metric: MetricKey): number | null {
   if (row.status !== "ok") {
@@ -49,7 +49,9 @@ export function computeRaceSummary(rows: BenchmarkRow[], metric: MetricKey): Rac
     if (!best) {
       return row;
     }
-    return (metricValue(row, metric) ?? 0) > (metricValue(best, metric) ?? 0) ? row : best;
+    const value = metricValue(row, metric) ?? 0;
+    const bestValue = metricValue(best, metric) ?? 0;
+    return metric === "p50Ms" ? (value < bestValue ? row : best) : (value > bestValue ? row : best);
   }, null);
   const albatross = okRows.find((row) => row.repo === "albatross") ?? null;
   const fastestValue = fastest ? metricValue(fastest, metric) : null;
@@ -58,7 +60,7 @@ export function computeRaceSummary(rows: BenchmarkRow[], metric: MetricKey): Rac
   return {
     fastest,
     albatross,
-    albatrossRatio: fastestValue && albatrossValue ? roundRatio(fastestValue / albatrossValue) : null,
+    albatrossRatio: fastestValue && albatrossValue ? roundRatio(metric === "p50Ms" ? albatrossValue / fastestValue : fastestValue / albatrossValue) : null,
     statusCounts
   };
 }
@@ -70,13 +72,15 @@ export function makeSeries(rows: BenchmarkRow[], metric: MetricKey, keyFn: (row:
     const series = byName.get(name) ?? { name, valueBuckets: new Map<number, SeriesValue[]>(), statusBuckets: new Map<string, StatusPoint>() };
     const value = metricValue(row, metric);
     if (value !== null) {
-      const bucket = series.valueBuckets.get(row.bsz) ?? [];
+      const x = xValueForTask(row);
+      const bucket = series.valueBuckets.get(x) ?? [];
       bucket.push({ value, row });
-      series.valueBuckets.set(row.bsz, bucket);
+      series.valueBuckets.set(x, bucket);
     } else if (isFailedStatus(row.status)) {
-      const key = String(row.bsz);
+      const x = xValueForTask(row);
+      const key = String(x);
       if (!series.statusBuckets.has(key)) {
-        series.statusBuckets.set(key, { x: row.bsz, status: "failed", row });
+        series.statusBuckets.set(key, { x, status: "failed", row });
       }
     }
     byName.set(name, series);
@@ -95,13 +99,14 @@ export function makeSeries(rows: BenchmarkRow[], metric: MetricKey, keyFn: (row:
 }
 
 export function seriesNameForRow(row: BenchmarkRow, rows: BenchmarkRow[], mode: "backend" | "model", groupBy: "model" | "backend"): string {
-  const needsQuant = backendHasMultipleQuantizations(row.repo, rows);
+  const needsQuant = backendHasMultipleQuantizations(row.backend, rows);
   const quantSuffix = needsQuant ? ` · ${row.quantization || row.dtype || "unknown"}` : "";
   if (mode === "backend") {
-    return `${row.repo}${quantSuffix}`;
+    return `${row.backend}${quantSuffix}`;
   }
   const modelName = displayModelName(row.modelId, row.modelLabel);
-  const base = groupBy === "model" ? `${modelName} · ${row.repo}` : `${row.repo} · ${modelName}`;
+  const backendName = row.backend || row.repo;
+  const base = groupBy === "model" ? `${modelName} · ${backendName}` : `${backendName} · ${modelName}`;
   return `${base}${quantSuffix}`;
 }
 
@@ -112,22 +117,51 @@ export function filterRows(
     mode: "backend" | "model";
     modelId?: string;
     paramGroup?: string;
-    promptLen?: number;
+    task?: BenchmarkTask;
     quantization?: string;
     repo?: string;
+    backend?: string;
     status?: string;
   }
 ): BenchmarkRow[] {
   return rows.filter((row) => {
-    if (row.benchmarkKind !== "synthetic_throughput") return false;
+    if (row.benchmarkKind !== "core_forward_sample_throughput") return false;
     if (filters.modelId && row.modelId !== filters.modelId) return false;
     if (filters.paramGroup && row.paramGroup !== filters.paramGroup) return false;
-    if (filters.promptLen && row.promptLen !== filters.promptLen) return false;
+    if (filters.task && row.task !== filters.task) return false;
     if (filters.quantization && row.quantization !== filters.quantization) return false;
     if (filters.repo && row.repo !== filters.repo) return false;
+    if (filters.backend && row.backend !== filters.backend) return false;
     if (filters.status && normalizedStatus(row.status) !== filters.status) return false;
     return true;
   });
+}
+
+export function xValueForTask(row: BenchmarkRow): number {
+  if (row.task === "prefill") {
+    return row.T;
+  }
+  if (row.task === "batch_decode") {
+    return row.B;
+  }
+  if (row.task === "batch_prefill") {
+    return row.B * row.T;
+  }
+  return row.B || row.T || 1;
+}
+
+export function xAxisNameForTask(task: BenchmarkTask): string {
+  if (task === "prefill") return "T (B1Tn)";
+  if (task === "batch_decode") return "B (BnT1)";
+  if (task === "batch_prefill") return "B*T (BnTn tokens)";
+  return "B/T (B1T1)";
+}
+
+export function taskAxisDescription(task: BenchmarkTask): string {
+  if (task === "prefill") return "Prefill / B1Tn: x is sequence length T; B is fixed at 1.";
+  if (task === "batch_decode") return "Batch Decode / BnT1: x is batch size B; T is fixed at 1.";
+  if (task === "batch_prefill") return "Batch Prefill / BnTn: x is measured token count B*T; rows keep exact B and T in the table.";
+  return "Decode / B1T1: x is the single B=1,T=1 point.";
 }
 
 export function uniqueSorted<T>(values: T[], rank?: (value: T) => number): T[] {
@@ -165,10 +199,10 @@ function medianPoint(x: number, values: SeriesValue[]) {
   };
 }
 
-function backendHasMultipleQuantizations(repo: string, rows: BenchmarkRow[]): boolean {
+function backendHasMultipleQuantizations(backend: string, rows: BenchmarkRow[]): boolean {
   const quantizations = new Set(
     rows
-      .filter((row) => row.repo === repo && row.status === "ok")
+      .filter((row) => row.backend === backend && row.status === "ok")
       .map((row) => row.quantization || row.dtype || "unknown")
   );
   return quantizations.size > 1;

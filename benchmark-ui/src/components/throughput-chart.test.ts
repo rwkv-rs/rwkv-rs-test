@@ -18,7 +18,8 @@ describe("throughput chart option", () => {
     ];
 
     const option = buildThroughputChartOption({
-      metric: "decodeTps",
+      metric: "forwardSampleTps",
+      task: "batch_decode",
       series,
       selectedName: null
     });
@@ -34,6 +35,32 @@ describe("throughput chart option", () => {
     expect(logAxisMin(null)).toBeUndefined();
   });
 
+  it("uses only observed x values so task-specific lines are not broken by empty ticks", () => {
+    const series: ChartSeries[] = [
+      {
+        name: "albatross",
+        points: [
+          { x: 16, y: 100, row: null as never },
+          { x: 64, y: 200, row: null as never },
+          { x: 256, y: 300, row: null as never },
+          { x: 1024, y: 400, row: null as never },
+          { x: 4096, y: 500, row: null as never }
+        ],
+        statusPoints: []
+      }
+    ];
+
+    const option = buildThroughputChartOption({
+      metric: "forwardSampleTps",
+      task: "prefill",
+      series,
+      selectedName: null
+    });
+
+    expect(option.xAxis.data).toEqual([16, 64, 256, 1024, 4096]);
+    expect(option.series[0].data).toEqual([100, 200, 300, 400, 500]);
+  });
+
   it("renders failed points as same-color x markers instead of a separate red backend", () => {
     const series: ChartSeries[] = [
       {
@@ -44,7 +71,8 @@ describe("throughput chart option", () => {
     ];
 
     const option = buildThroughputChartOption({
-      metric: "decodeTps",
+      metric: "forwardSampleTps",
+      task: "batch_decode",
       series,
       selectedName: null
     });
@@ -70,7 +98,8 @@ describe("throughput chart option", () => {
     ];
 
     const option = buildThroughputChartOption({
-      metric: "decodeTps",
+      metric: "forwardSampleTps",
+      task: "batch_decode",
       series,
       selectedName: null
     });
@@ -86,7 +115,8 @@ describe("throughput chart option", () => {
 
   it("uses fixed tooltip columns so backend names and values do not touch", () => {
     const option = buildThroughputChartOption({
-      metric: "decodeTps",
+      metric: "forwardSampleTps",
+      task: "batch_decode",
       series: [],
       selectedName: null
     });

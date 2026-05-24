@@ -22,11 +22,7 @@ use web_rwkv::{
         model::{ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion},
         v7, Dispatcher, Job, JobInput,
     },
-    tensor::{
-        kind::ReadWrite,
-        ops::TensorOp,
-        TensorCpu, TensorGpu, TensorShape,
-    },
+    tensor::{kind::ReadWrite, ops::TensorOp, TensorCpu, TensorGpu, TensorShape},
     tokenizer::Tokenizer,
 };
 
@@ -73,7 +69,10 @@ async fn create_context(info: &ModelInfo) -> Result<Context> {
     println!("web-rwkv adapter: {:?}", adapter.get_info());
     println!("web-rwkv adapter limits: {:?}", adapter.limits());
     println!("web-rwkv adapter features: {:?}", adapter.features());
-    Ok(ContextBuilder::new(adapter).auto_limits(info).build().await?)
+    Ok(ContextBuilder::new(adapter)
+        .auto_limits(info)
+        .build()
+        .await?)
 }
 
 async fn load_tokenizer() -> Result<Tokenizer> {
@@ -120,7 +119,11 @@ fn write_bytes(
     fs::create_dir_all(path.parent().unwrap())?;
 
     let view = TensorView::new(dtype, shape, bytes)?;
-    serialize_to_file([(path.file_stem().unwrap().to_string_lossy(), view)], None, &path)?;
+    serialize_to_file(
+        [(path.file_stem().unwrap().to_string_lossy(), view)],
+        None,
+        &path,
+    )?;
     write_time(&path, filename, elapsed_ns)
 }
 
@@ -227,24 +230,14 @@ fn build_hooks(
     let logits_shape = [info.num_vocab_padded(), 1, 1, 1];
 
     let filename = "embedding/embedded_context.safetensors".to_owned();
-    let target = snapshot_f16(
-        context,
-        &mut snapshots,
-        filename.clone(),
-        hidden_shape,
-    );
+    let target = snapshot_f16(context, &mut snapshots, filename.clone(), hidden_shape);
     hooks.insert(
         v7::Hook::PostEmbedLoaded,
         Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.input, &target)),
     );
 
     let filename = "layer_norm0/embedded_context.safetensors".to_owned();
-    let target = snapshot_f16(
-        context,
-        &mut snapshots,
-        filename.clone(),
-        hidden_shape,
-    );
+    let target = snapshot_f16(context, &mut snapshots, filename.clone(), hidden_shape);
     hooks.insert(
         v7::Hook::PostEmbedLayerNorm,
         Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.x, &target)),
@@ -253,24 +246,14 @@ fn build_hooks(
     for layer in 0..info.num_layer {
         let filename =
             format!("cells/cell_{layer:04}/time_mixer/value_from_first_cell.safetensors");
-        let target = snapshot_f16(
-            context,
-            &mut snapshots,
-            filename.clone(),
-            hidden_shape,
-        );
+        let target = snapshot_f16(context, &mut snapshots, filename.clone(), hidden_shape);
         hooks.insert(
             v7::Hook::PostAttValueResidual(layer),
             Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.att_v0, &target)),
         );
 
         let filename = format!("cells/cell_{layer:04}/time_mixer/embedded_context.safetensors");
-        let target = snapshot_f16(
-            context,
-            &mut snapshots,
-            filename.clone(),
-            hidden_shape,
-        );
+        let target = snapshot_f16(context, &mut snapshots, filename.clone(), hidden_shape);
         hooks.insert(
             v7::Hook::PostAttOut(layer),
             Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.att_o, &target)),
@@ -278,24 +261,14 @@ fn build_hooks(
 
         let filename =
             format!("cells/cell_{layer:04}/embedded_context_after_time_mixer.safetensors");
-        let target = snapshot_f16(
-            context,
-            &mut snapshots,
-            filename.clone(),
-            hidden_shape,
-        );
+        let target = snapshot_f16(context, &mut snapshots, filename.clone(), hidden_shape);
         hooks.insert(
             v7::Hook::PostAtt(layer),
             Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.x, &target)),
         );
 
         let filename = format!("cells/cell_{layer:04}/channel_mixer/embedded_context.safetensors");
-        let target = snapshot_f16(
-            context,
-            &mut snapshots,
-            filename.clone(),
-            hidden_shape,
-        );
+        let target = snapshot_f16(context, &mut snapshots, filename.clone(), hidden_shape);
         hooks.insert(
             v7::Hook::PostFfnChannelMix(layer),
             Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.ffn_x, &target)),
@@ -303,12 +276,7 @@ fn build_hooks(
 
         let filename =
             format!("cells/cell_{layer:04}/embedded_context_after_channel_mixer.safetensors");
-        let target = snapshot_f16(
-            context,
-            &mut snapshots,
-            filename.clone(),
-            hidden_shape,
-        );
+        let target = snapshot_f16(context, &mut snapshots, filename.clone(), hidden_shape);
         hooks.insert(
             v7::Hook::PostFfn(layer),
             Box::new(move |frame| traced_blit_f16(&filename, &frame.buffer.x, &target)),
@@ -328,12 +296,7 @@ fn build_hooks(
     );
 
     let filename = "lm_head/logits.safetensors".to_owned();
-    let target = snapshot_f32(
-        context,
-        &mut snapshots,
-        filename.clone(),
-        logits_shape,
-    );
+    let target = snapshot_f32(context, &mut snapshots, filename.clone(), logits_shape);
     hooks.insert(
         v7::Hook::PostHead,
         Box::new(move |frame| traced_blit_f32(&filename, &frame.header.head_o, &target)),

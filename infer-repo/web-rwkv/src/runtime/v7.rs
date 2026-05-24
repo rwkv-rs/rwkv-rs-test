@@ -1,13 +1,5 @@
 use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Instant};
 
-#[cfg(not(target_arch = "wasm32"))]
-use futures::future::BoxFuture;
-#[cfg(target_arch = "wasm32")]
-use futures::future::LocalBoxFuture;
-use half::f16;
-use itertools::Itertools;
-use serde::{Deserialize, Serialize};
-use web_rwkv_derive::DeserializeSeed;
 use super::{
     infer::{RnnChunk, RnnInfo, RnnInput, RnnOutput, RnnOutputBatch, RnnRedirect, Token},
     loader::{Loader, LoaderError, Reader},
@@ -29,6 +21,14 @@ use crate::{
         TensorReshape, TensorShape, TensorStack,
     },
 };
+#[cfg(not(target_arch = "wasm32"))]
+use futures::future::BoxFuture;
+#[cfg(target_arch = "wasm32")]
+use futures::future::LocalBoxFuture;
+use half::f16;
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+use web_rwkv_derive::DeserializeSeed;
 
 #[derive(Debug, Clone, Serialize, DeserializeSeed)]
 #[serde_seed(seed = "Seed", context = "Context")]

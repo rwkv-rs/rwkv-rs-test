@@ -23,6 +23,7 @@ Task 5 的 llama.cpp/RWKV 模型规模矩阵为：
 
 - `0.1B`: `rwkv7-g1d-0.1b-20260129-ctx8192`
 - `0.4B`: `rwkv7-g1d-0.4b-20260210-ctx8192`
+- `1.5B`: `rwkv7-g1f-1.5b-20260419-ctx8192`
 - `2.9B`: `rwkv7-g1f-2.9b-20260420-ctx8192`
 - `7.2B`: `rwkv7-g1f-7.2b-20260414-ctx8192`
 - `13.3B`: `rwkv7-g1f-13.3b-20260415-ctx8192`
@@ -35,9 +36,70 @@ Task 5 的 llama.cpp/RWKV 模型规模矩阵为：
 - `Q6_K`
 - `Q8_0`
 
-`1.5B` 可作为额外参考点，但不能替代上述五个规模，也不能让图表只围绕 `1.5B` 展开。
+上述六个规模都是 Task 5 core forward+sample 的必测矩阵；不能只测一个方便 checkpoint，
+也不能用某个参数量替代缺失参数量。
 
 ### Benchmark 类型
+
+#### 0. Core Forward+Sample Throughput
+
+目标：测每个后端真实任务入口的 `forward + sample` 计算吞吐，去掉框架调度和服务层开销。
+这是 Task 5 新的核心吞吐合同，不能再把所有形状压成一个抽象 `forward(B,T)`。
+
+旧解释错误在于：`B=1,T=1`、`B=1,T=n`、`B=n,T=1`、`B=n,T=n` 不是同一个
+forward 面的不同点，而是四类不同任务。后端必须调用各自真实入口：
+
+- `decode`: 单流 stateful one-token step，固定 `B=1,T=1`，测真实 decode 入口后采样一个 token。
+- `prefill`: 单流序列扫描，固定 `B=1,T=n`，测真实 sequence/prefill 入口，并从最后 logits 采样。
+- `batch_decode`: 多个独立 state 同时前进一步，`B=n,T=1`，必须是真 batch decode；不能循环调用单条 decode。
+- `batch_prefill`: 多个独立序列一起 prefill，`B=n,T=n`，必须是真 batch prefill；不能循环调用单条 prefill。
+
+采样属于被测负载。Tokenizer decode、文本打印、HTTP API、OpenAI server、request queue、
+scheduler loop、continuous batching framework、state-cache scheduling policy 都不属于这个 benchmark。
+
+必跑 canonical grid：
+
+| task | B values | T values | 说明 |
+| --- | --- | --- | --- |
+| `decode` | `1` | `1` | 所有后端应支持真实 one-token decode + sampler。 |
+| `prefill` | `1` | `16,64,256,1024,4096` | 单序列 prefill + sampler from final logits。 |
+| `batch_decode` | `2,4,8,16,32,64,128,256,512,960,1024` | `1` | 只有真 batch decode 才能 `ok`；否则写 `unsupported`。 |
+| `batch_prefill` | `2,4,8,16,32` | diagonal `2x2,4x4,8x8,16x16,32x32` | 只有真 batch prefill 才能 `ok`；否则写 `unsupported`。 |
+
+可选 stress grid 只能在 canonical grid 通过后追加：
+
+- `prefill`: `B=1,T=512/2048/8192`，前提是模型 context 和显存允许。
+- `batch_decode`: `B=320/768/1536/2048,T=1`，前提是后端真支持。
+- `batch_prefill`: `16x32,32x16,32x64,64x16,64x32`，并保留 `32x32` 作为 headline。
+
+导出：
+
+- `benchmark_kind=core_forward_sample_throughput`
+- 每行必须代表一个 `(backend, model, task, B, T)`。
+- 不支持组合写 `status=unsupported` 和具体原因；真实运行失败写 `status=failed` 和错误；成功写
+  `status=ok`。
+
+CSV 字段：
+
+- `run_id,repo,backend,runner,benchmark_kind,task`
+- `model_size,model_path,model_format,device,gpu_name,gpu_uuid,dtype,quantization`
+- `B,T,warmup,repeat,seed,status,error`
+- `input_tokens,measured_tokens,total_time_s,forward_time_s,sample_time_s`
+- `p10_ms,p50_ms,p90_ms,forward_sample_tps`
+- `entrypoint,measurement_boundary`
+- `command,binary_path,binary_build_id,model_bytes,model_sha256,started_at,ended_at`
+
+指标定义：
+
+- `total_time_s` 包含 forward 和 sample。
+- `forward_sample_tps = measured_tokens / total_time_s`。
+- decode-like 任务的 `measured_tokens = B`；prefill-like 任务的 `measured_tokens = B*T`。
+- `forward_time_s` 和 `sample_time_s` 可以为空，但 `status=ok` 必须有 `total_time_s`、`p50_ms`
+  和 `forward_sample_tps`。
+- `entrypoint` 必须写真实后端入口，例如 `forward_one`、`forward_seq`、`forward_seq_batch_1`、
+  `forward_batch`、`forward_from_x+sampler_simple_batch`、`web-rwkv Rnn::run`。
+- `measurement_boundary` 必须说明边界，例如
+  `forward+sampler; no tokenizer decode; no scheduler; no server`。
 
 #### 1. Synthetic Throughput
 

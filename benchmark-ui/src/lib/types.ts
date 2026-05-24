@@ -1,6 +1,7 @@
 export type BenchmarkStatus = "ok" | "failed" | "unsupported" | string;
 
-export type MetricKey = "decodeTps" | "prefillTps" | "e2eTps";
+export type MetricKey = "forwardSampleTps" | "p50Ms";
+export type BenchmarkTask = "decode" | "prefill" | "batch_decode" | "batch_prefill" | string;
 
 export interface BenchmarkRow {
   id: string;
@@ -13,18 +14,26 @@ export interface BenchmarkRow {
   repo: string;
   backend: string;
   runner: string;
+  task: BenchmarkTask;
   dtype: string;
   quantization: string;
-  bsz: number;
-  promptLen: number;
-  decodeLen: number;
+  B: number;
+  T: number;
   status: BenchmarkStatus;
   error: string;
-  prefillTps: number | null;
-  decodeTps: number | null;
-  e2eTps: number | null;
+  inputTokens: number;
+  measuredTokens: number;
+  totalTimeS: number | null;
+  forwardTimeS: number | null;
+  sampleTimeS: number | null;
+  p50Ms: number | null;
+  forwardSampleTps: number | null;
+  entrypoint: string;
+  measurementBoundary: string;
   gpuName: string;
   gpuUuid: string;
+  startedAt?: string;
+  endedAt?: string;
   sourcePath: string;
   command: string;
 }

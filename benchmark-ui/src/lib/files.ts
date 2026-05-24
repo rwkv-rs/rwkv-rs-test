@@ -3,22 +3,30 @@ import path from "node:path";
 import { buildDataset, normalizeTask5Rows, parseTask5Csv } from "./ingest";
 import type { BenchmarkRow, ModelGroupConfig, Task5Dataset } from "./types";
 
-const DEFAULT_SOURCE_ROOTS = [
-  path.resolve(process.cwd(), "..", "infer-repo")
-];
+const DEFAULT_SOURCE_ROOT = path.resolve(process.cwd(), "..", "results", "core-forward-sample", "merged-current");
 
-export async function loadTask5Dataset(sourceRoot = process.env.TASK5_RESULTS_ROOT || process.env.TASK5_RESULTS_ROOTS || DEFAULT_SOURCE_ROOTS.join(",")): Promise<Task5Dataset> {
+export async function loadTask5Dataset(sourceRoot = process.env.TASK5_RESULTS_ROOT || process.env.TASK5_RESULTS_ROOTS || DEFAULT_SOURCE_ROOT): Promise<Task5Dataset> {
   const config = await readModelConfig();
   const roots = parseSourceRoots(sourceRoot);
+  if (roots.length !== 1 && process.env.TASK5_ALLOW_MIXED_ROOTS !== "1") {
+    throw new Error(`Task5 frontend data must come from exactly one result batch root; got ${roots.length}: ${roots.join(", ")}`);
+  }
   const files = (await Promise.all(roots.map((root) => findTask5CsvFiles(root)))).flat();
   const rows: BenchmarkRow[] = [];
   for (const file of Array.from(new Set(files)).sort()) {
-    if (path.basename(file).includes("probe")) {
+    if (path.basename(file).includes("probe") || file.split(path.sep).some((segment) => segment.includes("smoke"))) {
       continue;
     }
     const content = await fs.readFile(file, "utf8");
+    if (!content.trim()) {
+      continue;
+    }
     const relative = path.relative(process.cwd(), file);
-    rows.push(...normalizeTask5Rows(parseTask5Csv(content), relative));
+    const rawRows = parseTask5Csv(content);
+    if (isLegacyUnwiredWebRwkvRows(rawRows)) {
+      continue;
+    }
+    rows.push(...normalizeTask5Rows(rawRows, relative));
   }
   return buildDataset(rows, roots.join(","), config);
 }
@@ -63,4 +71,13 @@ function parseSourceRoots(value: string): string[] {
     .map((item) => item.trim())
     .filter(Boolean)
     .map((item) => path.resolve(item));
+}
+
+function isLegacyUnwiredWebRwkvRows(rows: Record<string, string>[]): boolean {
+  return rows.length > 0 && rows.every((row) => (
+    row.repo === "web-rwkv"
+    && row.backend === "web-rwkv"
+    && row.status !== "ok"
+    && row.error.includes("direct core forward+sample timing is not wired yet")
+  ));
 }

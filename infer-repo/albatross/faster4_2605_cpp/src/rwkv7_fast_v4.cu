@@ -3,6 +3,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cctype>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <chrono>
@@ -30,6 +31,44 @@
 namespace {
 
 using namespace rwkv7_fast_v4;
+
+__global__ void argmax_sampler_f16_kernel(const half* logits, int* out, int rows, int vocab) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const half* row_logits = logits + static_cast<std::size_t>(row) * vocab;
+  float best_v = -FLT_MAX;
+  int best_i = 0;
+  for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
+    const float v = __half2float(row_logits[i]);
+    if (v > best_v || (v == best_v && i < best_i)) {
+      best_v = v;
+      best_i = i;
+    }
+  }
+  __shared__ float values[256];
+  __shared__ int indices[256];
+  values[threadIdx.x] = best_v;
+  indices[threadIdx.x] = best_i;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      const float other_v = values[threadIdx.x + stride];
+      const int other_i = indices[threadIdx.x + stride];
+      if (other_v > values[threadIdx.x] || (other_v == values[threadIdx.x] && other_i < indices[threadIdx.x])) {
+        values[threadIdx.x] = other_v;
+        indices[threadIdx.x] = other_i;
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    out[row] = indices[0];
+  }
+}
+
+void argmax_sampler_f16_launch(cudaStream_t stream, const half* logits, int* out, int rows, int vocab) {
+  argmax_sampler_f16_kernel<<<rows, 256, 0, stream>>>(logits, out, rows, vocab);
+}
 
 struct TraceWriter {
   const std::string repo_name = "albatross_faster4_2605_cpp";
@@ -917,6 +956,7 @@ void model_forward(const Case& c) {
   DeviceBuffer<half> wkv_state16;
   DeviceBuffer<float> wkv_state32;
   DeviceBuffer<int> elapsed;
+  DeviceBuffer<int> sampled;
   DeviceBuffer<unsigned char> lt_workspace;
   cudaStream_t stream = nullptr;
   check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create model forward stream");
@@ -927,6 +967,7 @@ void model_forward(const Case& c) {
     wkv_state16.resize(state_elems, "alloc model wkv16 state");
   }
   elapsed.resize(B, "alloc elapsed");
+  sampled.resize(output_rows, "alloc sampled tokens");
   lt_workspace.resize(static_cast<std::size_t>(128) << 20, "alloc cublasLt workspace");
 
   if (weights.cpu_emb_ln0_f16.size() != static_cast<std::size_t>(V) * C) {
@@ -1156,6 +1197,7 @@ void model_forward(const Case& c) {
     head_path.use_batched_rkv = false;
     head_path.cmix = CmixMode::Dense;
     linear_orig_layout_launch(stream, head_path, LinearGroup::Head, output_rows, C, V, final_x, hp(weights.head_w), lt_workspace.p, lt_workspace.n, logits);
+    argmax_sampler_f16_launch(stream, logits, sampled.p, output_rows, V);
     check_cuda(cudaGetLastError(), "launch model forward head");
   };
 

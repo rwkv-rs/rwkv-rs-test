@@ -885,7 +885,7 @@ class RWKV(pl.LightningModule):
 
         def forward(self, idx):
             x = self._forward_features(idx)
-            return self.head(x)
+            return trace("lm_head/projection", lambda: self.head(x))
 
         def training_step(self, batch, batch_idx):
             idx, targets = batch

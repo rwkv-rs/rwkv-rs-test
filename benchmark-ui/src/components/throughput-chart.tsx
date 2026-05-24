@@ -1,24 +1,26 @@
 "use client";
 
 import ReactECharts from "echarts-for-react";
-import type { ChartSeries, MetricKey } from "@/lib/types";
+import type { BenchmarkTask, ChartSeries, MetricKey } from "@/lib/types";
+import { xAxisNameForTask } from "@/lib/analytics";
 
 const COLORS = ["#cc0000", "#1a1a1a", "#3a8a9a", "#b86030", "#5a8a3a", "#d4a017", "#6b7280", "#9333ea"];
-const BSZ_TICKS = [1, 16, 64, 128, 256, 512, 1024];
 export const FAILED_SYMBOL = "path://M-5,-5L5,5M5,-5L-5,5";
 
 export function ThroughputChart({
   metric,
+  task,
   series,
   selectedName,
   onSelectName
 }: {
   metric: MetricKey;
+  task: BenchmarkTask;
   series: ChartSeries[];
   selectedName: string | null;
   onSelectName: (name: string) => void;
 }) {
-  const option = buildThroughputChartOption({ metric, series, selectedName });
+  const option = buildThroughputChartOption({ metric, task, series, selectedName });
 
   return (
     <div className="chartFrame">
@@ -59,10 +61,12 @@ export function ThroughputChart({
 
 export function buildThroughputChartOption({
   metric,
+  task,
   series,
   selectedName
 }: {
   metric: MetricKey;
+  task: BenchmarkTask;
   series: ChartSeries[];
   selectedName: string | null;
 }) {
@@ -78,7 +82,7 @@ export function buildThroughputChartOption({
       borderColor: "#1a1a1a",
       borderWidth: 2,
       textStyle: { color: "#1a1a1a", fontFamily: "Menlo, Consolas, monospace" },
-      formatter: formatTooltip
+      formatter: (params: unknown) => formatTooltip(params, metric)
     },
     legend: {
       show: false,
@@ -88,7 +92,7 @@ export function buildThroughputChartOption({
     xAxis: {
       type: "category",
       data: xTicks,
-      name: "bsz",
+      name: xAxisNameForTask(task),
       nameLocation: "middle",
       nameGap: 42,
       axisLabel: {
@@ -99,7 +103,7 @@ export function buildThroughputChartOption({
     },
     yAxis: {
       type: "log",
-      name: metric === "decodeTps" ? "decode TPS" : "prefill TPS",
+      name: metric === "p50Ms" ? "p50 ms" : "forward+sample TPS",
       nameLocation: "middle",
       nameGap: 54,
       min: logAxisMin(statusY),
@@ -143,7 +147,7 @@ export function buildThroughputChartOption({
   };
 }
 
-function formatTooltip(params: unknown): string {
+function formatTooltip(params: unknown, metric: MetricKey): string {
   const items = Array.isArray(params) ? params : [params];
   const title = escapeHtml(String(readParam(items[0], "name") ?? ""));
   const byName = new Map<string, { marker: string; value: number | null; failed: boolean }>();
@@ -167,7 +171,8 @@ function formatTooltip(params: unknown): string {
     }
   }
   const lines = Array.from(byName.entries()).map(([name, item]) => {
-    const value = item.failed ? "failed" : `${Math.round(item.value ?? 0).toLocaleString()} TPS`;
+    const suffix = metric === "p50Ms" ? " ms" : " TPS";
+    const value = item.failed ? "failed" : `${Math.round(item.value ?? 0).toLocaleString()}${suffix}`;
     return `<div style="display:grid;grid-template-columns:14px minmax(120px, 1fr) auto;column-gap:8px;align-items:center;margin:4px 0;">${item.marker}<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(name)}</span><strong style="text-align:right;white-space:nowrap;">${value}</strong></div>`;
   });
   return `<div style="min-width:230px;"><div style="margin-bottom:6px;font-weight:700;">${title}</div>${lines.join("")}</div>`;
@@ -189,7 +194,7 @@ function escapeHtml(value: string): string {
 }
 
 function collectBszTicks(series: ChartSeries[]): number[] {
-  const values = new Set(BSZ_TICKS);
+  const values = new Set<number>();
   for (const item of series) {
     for (const point of item.points) {
       values.add(point.x);

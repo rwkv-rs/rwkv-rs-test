@@ -359,12 +359,11 @@ class RWKV7:
                 else:
                     x, xx = self.add_ln(x, xx, z[p_next+"ln1.weight"], z[p_next+"ln1.bias"])
             elif not all_logits:
-                x = self.add(x, xx)
-                x = self.ln(x, z["ln_out.weight"], z["ln_out.bias"])
                 if last_indices is not None:
+                    x = self.ln(self.add(x, xx), z["ln_out.weight"], z["ln_out.bias"])
                     x = x[torch.arange(B, device=x.device), last_indices].contiguous()
                 else:
-                    x = x[:, -1, :].contiguous()
+                    x = self.add_last_ln(x, xx, z["ln_out.weight"], z["ln_out.bias"])
                 activation("lm_head/embedded_context.safetensors", x)
                 torch.ops.rwkv7_v3a_ops.advance_i32(state[2], T) # !!! IMPORTANT FOR WKV16 DITHERING !!!
                 return trace("lm_head", lambda: self.linear_head(x), x, outputs="lm_head/logits.safetensors")

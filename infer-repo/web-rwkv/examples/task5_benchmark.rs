@@ -1,8 +1,7 @@
 //! Task 5 benchmark CSV writer for the raw web-rwkv runtime path.
 
 use std::{
-    env,
-    fs,
+    env, fs,
     io::Write,
     path::{Path, PathBuf},
     process::Command,
@@ -42,7 +41,11 @@ struct Cli {
     telemetry_output: PathBuf,
     #[arg(long, value_name = "FILE", default_value = "results/manifest.jsonl")]
     manifest_output: PathBuf,
-    #[arg(long, value_name = "LIST", default_value = "1,16,64,128,256,320,512,960,1024")]
+    #[arg(
+        long,
+        value_name = "LIST",
+        default_value = "1,16,64,128,256,320,512,960,1024"
+    )]
     bsz: String,
     #[arg(long, value_name = "LIST", default_value = "16")]
     prompt_len: String,
@@ -214,7 +217,13 @@ async fn main() -> Result<()> {
         model_sha256: sha256sum(&cli.model).unwrap_or_default(),
         prompt_source: "synthetic_rng".to_owned(),
     };
-    append_manifest(&cli.manifest_output, &metadata, &cli, &model_format, &quantization)?;
+    append_manifest(
+        &cli.manifest_output,
+        &metadata,
+        &cli,
+        &model_format,
+        &quantization,
+    )?;
     let setup = Runner::new(&cli.model, quant, max_bsz(&cases), cli.token_chunk_size).await;
 
     let mut rows = vec![];
@@ -701,7 +710,10 @@ fn query_gpu_info() -> Result<GpuInfo> {
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let first = stdout.lines().next().context("nvidia-smi returned no GPU")?;
+    let first = stdout
+        .lines()
+        .next()
+        .context("nvidia-smi returned no GPU")?;
     let parts = first.split(',').map(str::trim).collect::<Vec<_>>();
     Ok(GpuInfo {
         name: parts.first().copied().unwrap_or_default().to_owned(),
@@ -757,7 +769,10 @@ fn append_manifest(
         "binary_build_id": metadata.binary_build_id,
         "created_at": timestamp(),
     });
-    let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     writeln!(file, "{}", record)?;
     Ok(())
 }
@@ -770,7 +785,10 @@ fn append_gpu_telemetry(path: &Path, run_id: &str, gpu_uuid: &str) -> Result<()>
         fs::create_dir_all(parent)?;
     }
     let exists = path.exists();
-    let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     if !exists {
         writeln!(
             file,
@@ -787,7 +805,11 @@ fn append_gpu_telemetry(path: &Path, run_id: &str, gpu_uuid: &str) -> Result<()>
         Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
             .lines()
             .next()
-            .map(|line| line.split(',').map(|part| part.trim().to_owned()).collect::<Vec<_>>())
+            .map(|line| {
+                line.split(',')
+                    .map(|part| part.trim().to_owned())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default(),
         _ => Vec::new(),
     };
